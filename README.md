@@ -1,4 +1,4 @@
-# Web Search MCP Server
+# BigOpenLLMSearch
 
 一个功能强大的 MCP (Model Context Protocol) 服务器，为 LLM 提供网页搜索、内容提取、网站爬取和深度研究能力。对标 Tavily，提供全面的联网搜索解决方案。
 
@@ -283,7 +283,7 @@ npm run lint
 ## 项目结构
 
 ```
-WebSearchApi/
+BigOpenLLMSearch/
 ├── src/
 │   ├── index.ts                 # MCP 服务器入口
 │   ├── tools/

@@ -14,7 +14,7 @@ import { ResearchTool, researchToolDefinition } from "./tools/research.js";
 
 const server = new Server(
   {
-    name: "web-search-mcp",
+    name: "bigopen-llm-search",
     version: "1.0.0",
   },
   {
@@ -87,7 +87,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("Web Search MCP server running on stdio");
+  console.error("BigOpenLLMSearch MCP server running on stdio");
 }
 
 main().catch((error) => {

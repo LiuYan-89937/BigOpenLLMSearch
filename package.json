@@ -1,11 +1,11 @@
 {
-  "name": "web-search-mcp",
+  "name": "bigopen-llm-search",
   "version": "1.0.0",
-  "description": "MCP server for web search, extraction, crawling, and research - powered by multiple search engines",
+  "description": "BigOpenLLMSearch - MCP server for web search, extraction, crawling, and research for LLM",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
-    "web-search-mcp": "./dist/index.js"
+    "bigopen-llm-search": "./dist/index.js"
   },
   "scripts": {
     "build": "tsc",
