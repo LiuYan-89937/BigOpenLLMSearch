@@ -1,0 +1,40 @@
+{
+  "name": "web-search-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for web search, extraction, crawling, and research - powered by multiple search engines",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "web-search-mcp": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "lint": "eslint src --ext .ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "mcp",
+    "web-search",
+    "llm",
+    "ai",
+    "search-api",
+    "tavily-alternative"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "axios": "^1.7.9",
+    "cheerio": "^1.0.0",
+    "turndown": "^7.2.0",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/turndown": "^5.0.5",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
