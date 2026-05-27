@@ -44,19 +44,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     switch (name) {
       case "web_search":
-        result = await SearchTool.execute(args as any);
+        result = await SearchTool.execute(args);
         break;
       case "web_extract":
-        result = await ExtractTool.execute(args as any);
+        result = await ExtractTool.execute(args);
         break;
       case "web_crawl":
-        result = await CrawlTool.execute(args as any);
+        result = await CrawlTool.execute(args);
         break;
       case "web_map":
-        result = await MapTool.execute(args as any);
+        result = await MapTool.execute(args);
         break;
       case "web_research":
-        result = await ResearchTool.execute(args as any);
+        result = await ResearchTool.execute(args);
         break;
       default:
         throw new Error(`Unknown tool: ${name}`);

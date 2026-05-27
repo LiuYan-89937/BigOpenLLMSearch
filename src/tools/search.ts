@@ -3,9 +3,11 @@ import { searchEngineManager, SearchOptions } from "../services/search-engines.j
 import { semanticSearch } from "../services/semantic-search.js";
 import { contentExtractor } from "../services/content-extractor.js";
 import { searchCache } from "../utils/cache.js";
+import { parseToolInput } from "../utils/tool-input.js";
+import { answerGenerator } from "../services/answer-generator.js";
 
 const SearchInputSchema = z.object({
-  query: z.string().describe("The search query to execute"),
+  query: z.string().trim().min(1).describe("The search query to execute"),
   search_depth: z.enum(["basic", "advanced", "fast", "ultra-fast"]).default("basic").describe(
     "Controls latency vs relevance: 'advanced' for highest relevance, 'basic' for balanced, 'fast' for lower latency, 'ultra-fast' for minimum latency"
   ),
@@ -14,9 +16,9 @@ const SearchInputSchema = z.object({
   ),
   max_results: z.number().min(1).max(20).default(5).describe("Maximum number of search results to return"),
   time_range: z.enum(["day", "week", "month", "year"]).optional().describe("Filter results by time range"),
-  start_date: z.string().optional().describe("Return results after this date (YYYY-MM-DD format)"),
-  end_date: z.string().optional().describe("Return results before this date (YYYY-MM-DD format)"),
-  include_answer: z.boolean().default(false).describe("Include an LLM-generated answer to the query"),
+  start_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe("Return results after this date (YYYY-MM-DD format)"),
+  end_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe("Return results before this date (YYYY-MM-DD format)"),
+  include_answer: z.boolean().default(false).describe("Include an answer generated from search sources"),
   include_raw_content: z.boolean().default(false).describe("Include the full parsed content of each result"),
   include_images: z.boolean().default(false).describe("Include images in the response"),
   include_domains: z.array(z.string()).default([]).describe("Domains to specifically include in results"),
@@ -35,7 +37,7 @@ export const searchToolDefinition = {
   inputSchema: {
     type: "object" as const,
     properties: {
-      query: { type: "string", description: "The search query to execute" },
+      query: { type: "string", minLength: 1, description: "The search query to execute" },
       search_depth: { 
         type: "string", 
         enum: ["basic", "advanced", "fast", "ultra-fast"],
@@ -52,7 +54,7 @@ export const searchToolDefinition = {
       time_range: { type: "string", enum: ["day", "week", "month", "year"], description: "Filter results by time range" },
       start_date: { type: "string", description: "Return results after this date (YYYY-MM-DD format)" },
       end_date: { type: "string", description: "Return results before this date (YYYY-MM-DD format)" },
-      include_answer: { type: "boolean", default: false, description: "Include an LLM-generated answer to the query" },
+      include_answer: { type: "boolean", default: false, description: "Include an answer generated from search sources" },
       include_raw_content: { type: "boolean", default: false, description: "Include the full parsed content of each result" },
       include_images: { type: "boolean", default: false, description: "Include images in the response" },
       include_domains: { type: "array", items: { type: "string" }, default: [], description: "Domains to specifically include in results" },
@@ -67,7 +69,8 @@ export const searchToolDefinition = {
 };
 
 export class SearchTool {
-  static async execute(input: SearchInput) {
+  static async execute(rawInput: unknown) {
+    const input = parseToolInput(SearchInputSchema, rawInput);
     const cacheKey = JSON.stringify(input);
     const cached = searchCache.get(cacheKey);
     if (cached) return cached;
@@ -89,6 +92,7 @@ export class SearchTool {
         excludeDomains: input.exclude_domains,
         country: input.country,
         exactMatch: input.exact_match,
+        engine: input.engine,
         extractContent: input.include_raw_content,
       });
     } else {
@@ -116,7 +120,7 @@ export class SearchTool {
       if (input.include_raw_content && result.results.length > 0) {
         const urls = result.results.map((r: any) => r.url);
         const contents = await contentExtractor.extractMultiple(urls, {
-          format: input.include_raw_content === true ? "markdown" : input.include_raw_content as any,
+          format: "markdown",
           extractDepth: input.search_depth === "advanced" ? "advanced" : "basic",
         });
 
@@ -125,6 +129,15 @@ export class SearchTool {
           ...r,
           raw_content: contentMap.get(r.url)?.content,
         }));
+      }
+
+      if (input.include_answer) {
+        result.answer = await answerGenerator.generate({
+          query: input.query,
+          sources: result.results,
+          format: "plain",
+          fallbackAnswer: result.answer,
+        });
       }
     }
 

@@ -1,5 +1,7 @@
-import axios from "axios";
-import { parseHtml, ParsedContent } from "../utils/html-parser.js";
+import { fetchText } from "../utils/http-client.js";
+import { parseHtml } from "../utils/html-parser.js";
+import { createInstructionMatcher } from "../utils/text-analysis.js";
+import { matchesDomain, normalizeHttpUrl } from "../utils/url-policy.js";
 
 export interface CrawlOptions {
   maxDepth?: number;
@@ -22,6 +24,7 @@ export interface CrawledPage {
   depth: number;
   links: string[];
   metadata: Record<string, string>;
+  images?: string[];
 }
 
 export interface CrawlResult {
@@ -31,121 +34,181 @@ export interface CrawlResult {
   errors: Array<{ url: string; error: string }>;
 }
 
+interface CrawlQueueItem {
+  url: string;
+  depth: number;
+}
+
+interface CrawlContext extends Required<Pick<CrawlOptions, "maxDepth" | "maxBreadth" | "limit" | "allowExternal" | "includeImages" | "extractDepth">> {
+  selectPaths?: string[];
+  selectDomains?: string[];
+  excludePaths?: string[];
+  excludeDomains?: string[];
+  startDomain: string;
+  instructionMatcher: ReturnType<typeof createInstructionMatcher>;
+}
+
 export class WebCrawler {
-  private visited = new Set<string>();
-  private userAgent = "Mozilla/5.0 (compatible; WebSearchMCP/1.0)";
-
   async crawl(startUrl: string, options: CrawlOptions = {}): Promise<CrawlResult> {
-    const {
-      maxDepth = 2,
-      maxBreadth = 10,
-      limit = 50,
-      selectPaths,
-      selectDomains,
-      excludePaths,
-      excludeDomains,
-      allowExternal = false,
-      includeImages = false,
-      extractDepth = "basic",
-    } = options;
+    const normalizedStartUrl = normalizeHttpUrl(startUrl);
+    if (!normalizedStartUrl) {
+      throw new Error(`Invalid start URL: ${startUrl}`);
+    }
 
-    this.visited.clear();
+    const context: CrawlContext = {
+      maxDepth: options.maxDepth ?? 2,
+      maxBreadth: options.maxBreadth ?? 10,
+      limit: options.limit ?? 50,
+      selectPaths: options.selectPaths,
+      selectDomains: options.selectDomains,
+      excludePaths: options.excludePaths,
+      excludeDomains: options.excludeDomains,
+      allowExternal: options.allowExternal ?? false,
+      includeImages: options.includeImages ?? false,
+      extractDepth: options.extractDepth ?? "basic",
+      startDomain: new URL(normalizedStartUrl).hostname,
+      instructionMatcher: createInstructionMatcher(options.instructions),
+    };
+    const visited = new Set<string>();
     const pages: CrawledPage[] = [];
     const errors: Array<{ url: string; error: string }> = [];
-    const queue: Array<{ url: string; depth: number }> = [{ url: startUrl, depth: 0 }];
+    const queue: CrawlQueueItem[] = [{ url: normalizedStartUrl, depth: 0 }];
 
-    const startDomain = new URL(startUrl).hostname;
+    while (queue.length > 0 && pages.length < context.limit) {
+      const batch = takeBatch(queue, visited, context);
+      if (batch.length === 0) {
+        continue;
+      }
 
-    while (queue.length > 0 && pages.length < limit) {
-      const batch = queue.splice(0, maxBreadth);
-      
-      const promises = batch.map(async ({ url, depth }) => {
-        if (this.visited.has(url)) return;
-        if (depth > maxDepth) return;
-        if (pages.length >= limit) return;
-
-        const urlObj = new URL(url);
-        const domain = urlObj.hostname;
-
-        if (!allowExternal && domain !== startDomain) return;
-
-        if (excludeDomains?.some(d => domain.includes(d))) return;
-        if (selectDomains?.length && !selectDomains.some(d => domain.includes(d))) return;
-
-        const path = urlObj.pathname;
-        if (excludePaths?.some(p => path.includes(p))) return;
-        if (selectPaths?.length && !selectPaths.some(p => path.includes(p))) return;
-
-        this.visited.add(url);
-
-        try {
-          const page = await this.fetchPage(url, depth, extractDepth);
-          pages.push(page);
-
-          if (depth < maxDepth) {
-            const newLinks = page.links
-              .filter(link => !this.visited.has(link))
-              .slice(0, maxBreadth);
-
-            for (const link of newLinks) {
-              queue.push({ url: link, depth: depth + 1 });
-            }
-          }
-        } catch (error) {
-          errors.push({
-            url,
-            error: error instanceof Error ? error.message : String(error),
-          });
+      const fetchedPages = await Promise.all(batch.map(item => this.fetchPage(item, context)));
+      for (const result of fetchedPages) {
+        if ("error" in result) {
+          errors.push(result.error);
+          continue;
         }
-      });
 
-      await Promise.all(promises);
+        if (pages.length >= context.limit) {
+          break;
+        }
+
+        pages.push(result.page);
+
+        if (result.page.depth < context.maxDepth) {
+          queue.push(...rankLinks(result.links, context)
+            .filter(link => !visited.has(link.url))
+            .slice(0, context.maxBreadth)
+            .map(link => ({ url: link.url, depth: result.page.depth + 1 })));
+        }
+      }
     }
 
     return {
-      startUrl,
+      startUrl: normalizedStartUrl,
       pages,
       totalPages: pages.length,
       errors,
     };
   }
 
-  private async fetchPage(url: string, depth: number, extractDepth: string): Promise<CrawledPage> {
-    const response = await axios.get(url, {
-      headers: {
-        "User-Agent": this.userAgent,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      },
-      timeout: 30000,
-      maxRedirects: 5,
-    });
+  private async fetchPage(
+    item: CrawlQueueItem,
+    context: CrawlContext
+  ): Promise<{ page: CrawledPage; links: Array<{ url: string; text: string }> } | { error: { url: string; error: string } }> {
+    try {
+      const response = await fetchText(item.url);
+      const parsed = parseHtml(response.body, response.url);
+      const contentSource = parsed.content || parsed.text;
+      const content = context.extractDepth === "advanced"
+        ? contentSource
+        : contentSource.substring(0, 2000);
+      const links = parsed.links
+        .map(link => ({
+          url: normalizeHttpUrl(link.href, response.url),
+          text: link.text,
+        }))
+        .filter((link): link is { url: string; text: string } => Boolean(link.url));
 
-    const html = response.data;
-    const parsed = parseHtml(html, url);
-
-    const links = parsed.links
-      .map(link => {
-        try {
-          return new URL(link.href, url).href;
-        } catch {
-          return null;
-        }
-      })
-      .filter((link): link is string => link !== null);
-
-    const content = extractDepth === "advanced" 
-      ? parsed.content 
-      : parsed.content.substring(0, 2000);
-
-    return {
-      url,
-      title: parsed.title,
-      content,
-      depth,
-      links,
-      metadata: parsed.metadata,
-    };
+      return {
+        page: {
+          url: item.url,
+          title: parsed.title,
+          content,
+          depth: item.depth,
+          links: links.map(link => link.url),
+          metadata: parsed.metadata,
+          images: context.includeImages ? parsed.images.map(image => image.src) : undefined,
+        },
+        links,
+      };
+    } catch (error) {
+      return {
+        error: {
+          url: item.url,
+          error: error instanceof Error ? error.message : String(error),
+        },
+      };
+    }
   }
+}
+
+function takeBatch(queue: CrawlQueueItem[], visited: Set<string>, context: CrawlContext): CrawlQueueItem[] {
+  const batch: CrawlQueueItem[] = [];
+
+  while (queue.length > 0 && batch.length < context.maxBreadth) {
+    const item = queue.shift();
+    if (!item || visited.has(item.url) || item.depth > context.maxDepth) {
+      continue;
+    }
+
+    if (!shouldVisitUrl(item.url, context)) {
+      continue;
+    }
+
+    visited.add(item.url);
+    batch.push(item);
+  }
+
+  return batch;
+}
+
+function shouldVisitUrl(url: string, context: CrawlContext): boolean {
+  const parsed = new URL(url);
+  if (!context.allowExternal && parsed.hostname !== context.startDomain) {
+    return false;
+  }
+
+  if (context.excludeDomains?.length && matchesDomain(parsed.hostname, context.excludeDomains)) {
+    return false;
+  }
+
+  if (context.selectDomains?.length && !matchesDomain(parsed.hostname, context.selectDomains)) {
+    return false;
+  }
+
+  if (context.excludePaths?.some(path => parsed.pathname.includes(path))) {
+    return false;
+  }
+
+  if (context.selectPaths?.length && !context.selectPaths.some(path => parsed.pathname.includes(path))) {
+    return false;
+  }
+
+  return true;
+}
+
+function rankLinks(
+  links: Array<{ url: string; text: string }>,
+  context: CrawlContext
+): Array<{ url: string; text: string }> {
+  if (!context.instructionMatcher.hasInstructions) {
+    return links;
+  }
+
+  return [...links].sort((a, b) => {
+    const scoreA = context.instructionMatcher.score(`${a.text} ${a.url}`);
+    const scoreB = context.instructionMatcher.score(`${b.text} ${b.url}`);
+    return scoreB - scoreA;
+  });
 }
 
 export const webCrawler = new WebCrawler();

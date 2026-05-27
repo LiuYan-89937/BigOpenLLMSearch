@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { webCrawler, CrawlOptions } from "../services/web-crawler.js";
 import { contentCache } from "../utils/cache.js";
+import { parseToolInput } from "../utils/tool-input.js";
 
 const CrawlInputSchema = z.object({
   url: z.string().url().describe("The starting URL to crawl from"),
@@ -43,7 +44,8 @@ export const crawlToolDefinition = {
 };
 
 export class CrawlTool {
-  static async execute(input: CrawlInput) {
+  static async execute(rawInput: unknown) {
+    const input = parseToolInput(CrawlInputSchema, rawInput);
     const cacheKey = JSON.stringify(input);
     const cached = contentCache.get(cacheKey);
     if (cached) return cached;
@@ -72,6 +74,7 @@ export class CrawlTool {
         content: page.content,
         depth: page.depth,
         links_count: page.links.length,
+        images: page.images,
       })),
       total_pages: result.totalPages,
       errors: result.errors,

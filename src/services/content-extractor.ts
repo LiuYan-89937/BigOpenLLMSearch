@@ -1,5 +1,5 @@
-import axios from "axios";
-import { parseHtml, extractChunks, ParsedContent } from "../utils/html-parser.js";
+import { fetchText } from "../utils/http-client.js";
+import { extractChunks, parseHtml } from "../utils/html-parser.js";
 
 export interface ExtractOptions {
   format?: "markdown" | "text";
@@ -18,8 +18,6 @@ export interface ExtractedContent {
 }
 
 export class ContentExtractor {
-  private userAgent = "Mozilla/5.0 (compatible; WebSearchMCP/1.0)";
-
   async extract(url: string, options: ExtractOptions = {}): Promise<ExtractedContent> {
     const {
       format = "markdown",
@@ -28,75 +26,62 @@ export class ContentExtractor {
       chunksPerSource = 3,
     } = options;
 
-    try {
-      const response = await axios.get(url, {
-        headers: {
-          "User-Agent": this.userAgent,
-          "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-          "Accept-Language": "en-US,en;q=0.5",
-        },
-        timeout: 30000,
-        maxRedirects: 5,
-      });
+    const response = await fetchText(url);
+    const parsed = parseHtml(response.body, response.url);
+    const plainText = parsed.content || parsed.text;
+    const textContent = extractDepth === "advanced"
+      ? extractChunks(plainText, chunksPerSource).join("\n\n[...]\n\n")
+      : plainText.substring(0, 5000);
+    const markdownContent = extractDepth === "advanced"
+      ? extractChunks(parsed.markdown, chunksPerSource, 1200).join("\n\n[...]\n\n")
+      : parsed.markdown;
 
-      const html = response.data;
-      const parsed = parseHtml(html, url);
+    const result: ExtractedContent = {
+      url,
+      title: parsed.title,
+      content: format === "markdown" ? markdownContent : textContent,
+    };
 
-      let content: string;
-      if (extractDepth === "advanced") {
-        const chunks = extractChunks(parsed.content, chunksPerSource);
-        content = chunks.join("\n\n[...]\n\n");
-      } else {
-        content = parsed.content.substring(0, 5000);
-      }
-
-      const result: ExtractedContent = {
-        url,
-        title: parsed.title,
-        content: format === "markdown" ? parsed.markdown : content,
-      };
-
-      if (format === "markdown") {
-        result.markdown = parsed.markdown;
-      }
-
-      if (includeImages) {
-        result.images = parsed.images.map(img => img.src);
-      }
-
-      const favicon = parsed.metadata["favicon"] || 
-                      parsed.images.find(img => img.src.includes("favicon"))?.src;
-      if (favicon) {
-        result.favicon = favicon;
-      }
-
-      return result;
-    } catch (error) {
-      if (axios.isAxiosError(error)) {
-        throw new Error(`Failed to extract content from ${url}: ${error.message}`);
-      }
-      throw error;
+    if (format === "markdown") {
+      result.markdown = markdownContent;
     }
+
+    if (includeImages) {
+      result.images = parsed.images.map(image => image.src);
+    }
+
+    const favicon = parsed.metadata.icon ||
+      parsed.metadata["shortcut icon"] ||
+      parsed.metadata["og:image"] ||
+      parsed.images.find(image => image.src.includes("favicon"))?.src;
+    if (favicon) {
+      result.favicon = favicon;
+    }
+
+    return result;
   }
 
   async extractMultiple(urls: string[], options: ExtractOptions = {}): Promise<ExtractedContent[]> {
-    const promises = urls.map(url => 
-      this.extract(url, options).catch(error => ({
-        url,
-        title: "Error",
-        content: `Failed to extract: ${error.message}`,
-      }))
-    );
+    const results = await Promise.all(urls.map(async url => {
+      try {
+        return await this.extract(url, options);
+      } catch (error) {
+        return {
+          url,
+          title: "Error",
+          content: `Failed to extract: ${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
+    }));
 
-    return Promise.all(promises);
+    return results;
   }
 
   async extractFromSearchResults(
     results: Array<{ url: string; snippet?: string }>,
     options: ExtractOptions = {}
   ): Promise<ExtractedContent[]> {
-    const urls = results.map(r => r.url);
-    return this.extractMultiple(urls, options);
+    return this.extractMultiple(results.map(result => result.url), options);
   }
 }
 

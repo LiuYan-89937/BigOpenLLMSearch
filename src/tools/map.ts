@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { siteMapper, MapOptions } from "../services/site-mapper.js";
 import { contentCache } from "../utils/cache.js";
+import { parseToolInput } from "../utils/tool-input.js";
 
 const MapInputSchema = z.object({
   url: z.string().url().describe("The starting URL to map"),
@@ -39,7 +40,8 @@ export const mapToolDefinition = {
 };
 
 export class MapTool {
-  static async execute(input: MapInput) {
+  static async execute(rawInput: unknown) {
+    const input = parseToolInput(MapInputSchema, rawInput);
     const cacheKey = JSON.stringify(input);
     const cached = contentCache.get(cacheKey);
     if (cached) return cached;
@@ -71,6 +73,7 @@ export class MapTool {
       })),
       total_pages: mapResult.totalPages,
       sitemap_urls: sitemapUrls,
+      errors: mapResult.errors,
     };
 
     contentCache.set(cacheKey, response);

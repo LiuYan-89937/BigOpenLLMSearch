@@ -1,11 +1,17 @@
 import { z } from "zod";
-import { searchEngineManager, SearchOptions } from "../services/search-engines.js";
+import { searchEngineManager } from "../services/search-engines.js";
 import { contentExtractor } from "../services/content-extractor.js";
-import { semanticSearch } from "../services/semantic-search.js";
 import { contentCache } from "../utils/cache.js";
+import {
+  buildResearchQueries,
+  extractRelevantSentences,
+  scoreTextRelevance,
+} from "../utils/text-analysis.js";
+import { parseToolInput } from "../utils/tool-input.js";
+import { answerGenerator } from "../services/answer-generator.js";
 
 const ResearchInputSchema = z.object({
-  query: z.string().describe("The research question or topic to investigate"),
+  query: z.string().trim().min(1).describe("The research question or topic to investigate"),
   max_sources: z.number().min(3).max(20).default(10).describe("Maximum number of sources to analyze"),
   search_depth: z.enum(["basic", "advanced"]).default("advanced").describe("Search depth for finding sources"),
   include_answer: z.boolean().default(true).describe("Generate a comprehensive answer from the research"),
@@ -36,7 +42,7 @@ export const researchToolDefinition = {
   inputSchema: {
     type: "object" as const,
     properties: {
-      query: { type: "string", description: "The research question or topic to investigate" },
+      query: { type: "string", minLength: 1, description: "The research question or topic to investigate" },
       max_sources: { type: "number", minimum: 3, maximum: 20, default: 10, description: "Maximum number of sources to analyze" },
       search_depth: { type: "string", enum: ["basic", "advanced"], default: "advanced", description: "Search depth for finding sources" },
       include_answer: { type: "boolean", default: true, description: "Generate a comprehensive answer" },
@@ -54,10 +60,14 @@ export const researchToolDefinition = {
 };
 
 export class ResearchTool {
-  static async execute(input: ResearchInput): Promise<ResearchResult> {
+  static async execute(rawInput: unknown): Promise<ResearchResult> {
+    const input = parseToolInput(ResearchInputSchema, rawInput);
     const startTime = Date.now();
+    const cacheKey = JSON.stringify(input);
+    const cached = contentCache.get(cacheKey);
+    if (cached) return cached;
     
-    const searchQueries = this.generateSearchQueries(input.query);
+    const searchQueries = buildResearchQueries(input.query);
     
     const searchPromises = searchQueries.map(query =>
       searchEngineManager.multiSearch(query, {
@@ -103,7 +113,11 @@ export class ResearchTool {
         url: source.url,
         snippet: source.snippet,
         content: 'content' in extracted ? extracted.content : source.snippet,
-        relevance: this.calculateRelevance(input.query, source.title, source.snippet),
+        relevance: scoreTextRelevance(input.query, [
+          { text: source.title, weight: 0.45 },
+          { text: source.snippet, weight: 0.35 },
+          { text: 'content' in extracted ? extracted.content : source.snippet, weight: 0.2 },
+        ]),
       };
     });
 
@@ -113,77 +127,28 @@ export class ResearchTool {
 
     let answer: string | undefined;
     if (input.include_answer) {
-      answer = this.generateResearchAnswer(input.query, enrichedSources, input.output_format);
+      answer = await answerGenerator.generate({
+        query: input.query,
+        sources: enrichedSources,
+        format: input.output_format,
+        fallbackAnswer: this.generateResearchAnswer(input.query, enrichedSources, input.output_format),
+      });
     }
 
-    return {
+    const response = {
       query: input.query,
       answer,
       sources: enrichedSources,
       key_findings: keyFindings,
       response_time: (Date.now() - startTime) / 1000,
     };
-  }
 
-  private static generateSearchQueries(query: string): string[] {
-    const queries = [query];
-    
-    const words = query.split(/\s+/);
-    if (words.length > 3) {
-      queries.push(words.slice(0, Math.ceil(words.length / 2)).join(" "));
-    }
-
-    queries.push(`${query} latest developments`);
-    queries.push(`${query} analysis`);
-
-    return queries.slice(0, 3);
-  }
-
-  private static calculateRelevance(query: string, title: string, snippet: string): number {
-    const queryTerms = query.toLowerCase().split(/\s+/).filter(t => t.length > 2);
-    const titleLower = title.toLowerCase();
-    const snippetLower = snippet.toLowerCase();
-
-    let score = 0;
-    let matchedTerms = 0;
-
-    for (const term of queryTerms) {
-      if (titleLower.includes(term)) {
-        score += 0.4;
-        matchedTerms++;
-      }
-      if (snippetLower.includes(term)) {
-        score += 0.3;
-        matchedTerms++;
-      }
-    }
-
-    score += (matchedTerms / queryTerms.length) * 0.3;
-
-    return Math.min(score, 1);
+    contentCache.set(cacheKey, response);
+    return response;
   }
 
   private static extractKeyFindings(query: string, sources: Array<{ title: string; snippet: string; content?: string }>): string[] {
-    const findings: string[] = [];
-    const seen = new Set<string>();
-
-    for (const source of sources.slice(0, 5)) {
-      const text = source.content || source.snippet;
-      const sentences = text.split(/[.!?]+/).filter(s => s.trim().length > 30);
-
-      for (const sentence of sentences.slice(0, 2)) {
-        const trimmed = sentence.trim();
-        if (trimmed.length > 30 && !seen.has(trimmed)) {
-          seen.add(trimmed);
-          findings.push(trimmed);
-          if (findings.length >= 5) break;
-        }
-      }
-
-      if (findings.length >= 5) break;
-    }
-
-    return findings;
+    return extractRelevantSentences(query, sources.slice(0, 5), 5);
   }
 
   private static generateResearchAnswer(
@@ -191,39 +156,21 @@ export class ResearchTool {
     sources: Array<{ title: string; snippet: string; content?: string }>,
     format: string
   ): string {
-    const relevantContent = sources
-      .slice(0, 5)
-      .map(s => s.content || s.snippet)
-      .join("\n\n");
-
-    const sentences = relevantContent.split(/[.!?]+/).filter(s => s.trim().length > 30);
-    
-    const queryTerms = query.toLowerCase().split(/\s+/);
-    const relevantSentences = sentences
-      .map(sentence => ({
-        text: sentence.trim(),
-        relevance: queryTerms.filter(term => 
-          sentence.toLowerCase().includes(term)
-        ).length,
-      }))
-      .filter(s => s.relevance > 0)
-      .sort((a, b) => b.relevance - a.relevance)
-      .slice(0, 8);
-
-    if (relevantSentences.length === 0) {
-      return `Based on the research for "${query}": ${sources[0]?.snippet || "No relevant information found."}`;
+    const sentences = extractRelevantSentences(query, sources, format === "report" ? 8 : 3);
+    if (sentences.length === 0) {
+      return sources[0]?.snippet || sources[0]?.content || "No relevant information found.";
     }
 
     switch (format) {
       case "bullet_points":
-        return `Research findings for "${query}":\n\n${relevantSentences.map(s => `• ${s.text}`).join("\n")}`;
+        return `Research findings for "${query}":\n\n${sentences.map(sentence => `- ${sentence}`).join("\n")}`;
       
       case "summary":
-        return `Summary of research on "${query}": ${relevantSentences.slice(0, 3).map(s => s.text).join(". ")}.`;
+        return `Summary of research on "${query}": ${sentences.join(". ")}.`;
       
       case "report":
       default:
-        return `Research Report: ${query}\n\nKey Information:\n${relevantSentences.map(s => `- ${s.text}`).join("\n")}\n\nSources: ${sources.slice(0, 3).map(s => s.title).join(", ")}`;
+        return `Research Report: ${query}\n\nKey information:\n${sentences.map(sentence => `- ${sentence}`).join("\n")}\n\nSources: ${sources.slice(0, 3).map(s => s.title).join(", ")}`;
     }
   }
 }

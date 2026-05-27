@@ -48,9 +48,16 @@ GOOGLE_SEARCH_ENGINE_ID=你的Google搜索引擎ID
 BRAVE_API_KEY=你的Brave密钥
 SERPAPI_API_KEY=你的SerpApi密钥
 SEARXNG_URL=https://你的SearXNG实例地址
+
+# 可选：启用 include_answer / web_research 的 AI 生成答案
+LLM_API_KEY=你的OpenAI兼容接口密钥
+LLM_MODEL=你的模型名
+LLM_BASE_URL=https://你的OpenAI兼容接口/v1
 ```
 
 > **提示**：DuckDuckGo 无需 API Key，默认可用。如果未配置其他引擎，将使用 DuckDuckGo。
+> **AI 答案**：`LLM_API_KEY` 和 `LLM_MODEL` 同时存在时，`include_answer` 与 `web_research` 会调用 OpenAI 兼容接口生成带来源约束的答案；未配置时会自动降级为基于搜索结果/正文的抽取式摘要。
+> **Topic 策略**：`topic` 的查询扩展词和重排词集中放在 `config/search-topics.json`，不要在搜索代码里为具体关键词加特例。
 
 ### 3. 启动服务
 
@@ -113,7 +120,7 @@ npm start
 | `time_range` | string | - | 时间范围：`day`/`week`/`month`/`year` |
 | `start_date` | string | - | 起始日期 (YYYY-MM-DD) |
 | `end_date` | string | - | 结束日期 (YYYY-MM-DD) |
-| `include_answer` | boolean | false | 是否包含 AI 生成的答案 |
+| `include_answer` | boolean | false | 是否包含答案；配置 LLM 时为 AI 生成，否则为抽取式摘要 |
 | `include_raw_content` | boolean | false | 是否包含完整网页内容 |
 | `include_images` | boolean | false | 是否包含图片 |
 | `include_domains` | string[] | [] | 限定搜索域名 |
@@ -229,7 +236,7 @@ npm start
 | `query` | string | 必填 | 研究问题或主题 |
 | `max_sources` | number | 10 | 最大来源数 (3-20) |
 | `search_depth` | string | "advanced" | 搜索深度：`basic`/`advanced` |
-| `include_answer` | boolean | true | 是否生成综合答案 |
+| `include_answer` | boolean | true | 是否生成综合答案；配置 LLM 时为 AI 生成，否则为抽取式摘要 |
 | `output_format` | string | "report" | 输出格式：`report`/`summary`/`bullet_points` |
 | `time_range` | string | - | 时间范围过滤 |
 | `engines` | string[] | - | 使用的搜索引擎 |
@@ -249,10 +256,10 @@ npm start
 
 | 深度 | 延迟 | 相关性 | 说明 |
 |------|------|--------|------|
-| `ultra-fast` | 最低 | 良好 | 适合时间敏感的查询 |
-| `fast` | 低 | 较好 | 快速获取结果 |
-| `basic` | 中等 | 较好 | 通用搜索 |
-| `advanced` | 高 | 最佳 | 最高相关性，每个源返回多个片段 |
+| `ultra-fast` | 最低 | 良好 | 保留搜索引擎原始顺序，最少候选扩展 |
+| `fast` | 低 | 较好 | 快速获取结果，并做轻量后过滤 |
+| `basic` | 中等 | 较好 | 扩展候选结果并按标题/摘要/URL 相关性重排 |
+| `advanced` | 高 | 最佳 | 扩展更多候选结果，强化相关性重排；配合 `include_raw_content` 可提取正文 |
 
 ## 与 Tavily 功能对比
 
@@ -284,6 +291,8 @@ npm run lint
 
 ```
 BigOpenLLMSearch/
+├── config/
+│   └── search-topics.json      # topic 查询扩展与重排策略
 ├── src/
 │   ├── index.ts                 # MCP 服务器入口
 │   ├── tools/

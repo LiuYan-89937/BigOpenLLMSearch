@@ -1,4 +1,11 @@
 import axios from "axios";
+import { buildSearchQuery, normalizeDomains } from "../utils/search-query.js";
+import { scoreTextRelevance } from "../utils/text-analysis.js";
+import { matchesDomain } from "../utils/url-policy.js";
+import { loadEnvFile } from "../utils/env.js";
+import { getSearchTopicProfile, SearchTopic } from "../config/search-topics.js";
+
+loadEnvFile();
 
 export interface SearchResult {
   title: string;
@@ -9,6 +16,7 @@ export interface SearchResult {
   publishedDate?: string;
   favicon?: string;
   images?: string[];
+  engine?: string;
 }
 
 export interface SearchResponse {
@@ -18,12 +26,15 @@ export interface SearchResponse {
   images?: string[];
   responseTime: number;
   totalResults?: number;
+  engine?: string;
+  engines?: string[];
+  errors?: Array<{ engine: string; error: string }>;
 }
 
 export interface SearchOptions {
   maxResults?: number;
   searchDepth?: "basic" | "advanced" | "fast" | "ultra-fast";
-  topic?: "general" | "news" | "finance";
+  topic?: SearchTopic;
   timeRange?: "day" | "week" | "month" | "year";
   startDate?: string;
   endDate?: string;
@@ -41,122 +52,103 @@ export interface SearchEngine {
   search(query: string, options?: SearchOptions): Promise<SearchResponse>;
 }
 
+interface SearchContext {
+  query: string;
+  providerQuery: string;
+  options: SearchOptions;
+  startTime: number;
+}
+
 export class BingSearchEngine implements SearchEngine {
   name = "bing";
-  private apiKey: string;
 
-  constructor(apiKey: string) {
-    this.apiKey = apiKey;
-  }
+  constructor(private apiKey: string) {}
 
   async search(query: string, options: SearchOptions = {}): Promise<SearchResponse> {
-    const startTime = Date.now();
-    const { maxResults = 10, timeRange, startDate, endDate } = options;
-
-    const params: any = {
-      q: query,
-      count: maxResults,
-      mkt: options.country ? `${options.country}-${options.country.toUpperCase()}` : "en-US",
-      responseFilter: "Webpages",
+    const context = createSearchContext(query, options);
+    const topicProfile = getSearchTopicProfile(options.topic);
+    const params: Record<string, unknown> = {
+      q: context.providerQuery,
+      count: Math.min(context.options.maxResults ?? 10, 50),
+      responseFilter: topicProfile.nativeCategory === "news" ? "News" : "Webpages",
     };
 
-    if (timeRange) {
-      const now = new Date();
-      let freshness: string;
-      switch (timeRange) {
-        case "day": freshness = "Day"; break;
-        case "week": freshness = "Week"; break;
-        case "month": freshness = "Month"; break;
-        case "year": freshness = "Year"; break;
-        default: freshness = "";
-      }
-      if (freshness) params.freshness = freshness;
+    if (options.country) {
+      params.cc = options.country.toUpperCase();
     }
 
-    try {
-      const response = await axios.get("https://api.bing.microsoft.com/v7.0/search", {
-        headers: { "Ocp-Apim-Subscription-Key": this.apiKey },
-        params,
-      });
-
-      const results: SearchResult[] = (response.data.webPages?.value || []).map((item: any) => ({
-        title: item.name,
-        url: item.url,
-        snippet: item.snippet,
-        content: options.includeRawContent ? undefined : undefined,
-        favicon: item.deepLinks?.[0]?.thumbnailUrl,
-      }));
-
-      return {
-        query,
-        results,
-        responseTime: (Date.now() - startTime) / 1000,
-        totalResults: response.data.webPages?.totalEstimatedMatches,
-      };
-    } catch (error) {
-      throw new Error(`Bing search failed: ${error}`);
+    const freshness = mapBingFreshness(options.timeRange);
+    if (freshness) {
+      params.freshness = freshness;
     }
+
+    const response = await axios.get("https://api.bing.microsoft.com/v7.0/search", {
+      headers: { "Ocp-Apim-Subscription-Key": this.apiKey },
+      params,
+    });
+
+    const webResults = response.data.webPages?.value ?? [];
+    const newsResults = response.data.news?.value ?? [];
+    const results: SearchResult[] = [...webResults, ...newsResults].map((item: any) => ({
+      title: item.name,
+      url: item.url,
+      snippet: item.snippet || item.description || "",
+      favicon: item.deepLinks?.[0]?.thumbnailUrl,
+      publishedDate: item.datePublished,
+      images: item.image?.thumbnail?.contentUrl ? [item.image.thumbnail.contentUrl] : undefined,
+      engine: this.name,
+    }));
+
+    return finalizeEngineResponse(context, this.name, results, response.data.webPages?.totalEstimatedMatches);
   }
 }
 
 export class GoogleSearchEngine implements SearchEngine {
   name = "google";
-  private apiKey: string;
-  private searchEngineId: string;
 
-  constructor(apiKey: string, searchEngineId: string) {
-    this.apiKey = apiKey;
-    this.searchEngineId = searchEngineId;
-  }
+  constructor(
+    private apiKey: string,
+    private searchEngineId: string
+  ) {}
 
   async search(query: string, options: SearchOptions = {}): Promise<SearchResponse> {
-    const startTime = Date.now();
-    const { maxResults = 10, timeRange, startDate, endDate } = options;
-
-    const params: any = {
+    const context = createSearchContext(query, options);
+    const params: Record<string, unknown> = {
       key: this.apiKey,
       cx: this.searchEngineId,
-      q: query,
-      num: maxResults,
+      q: context.providerQuery,
+      num: Math.min(context.options.maxResults ?? 10, 10),
     };
 
-    if (timeRange) {
-      const now = new Date();
-      let dateRestrict: string;
-      switch (timeRange) {
-        case "day": dateRestrict = "d1"; break;
-        case "week": dateRestrict = "w1"; break;
-        case "month": dateRestrict = "m1"; break;
-        case "year": dateRestrict = "y1"; break;
-        default: dateRestrict = "";
-      }
-      if (dateRestrict) params.dateRestrict = dateRestrict;
+    const dateRestrict = mapGoogleDateRestrict(options.timeRange);
+    if (dateRestrict) {
+      params.dateRestrict = dateRestrict;
     }
 
-    if (startDate) {
-      params.sort = `date:r:${startDate.replace(/-/g, "")}:`;
+    if (options.startDate || options.endDate) {
+      params.sort = buildGoogleDateSort(options.startDate, options.endDate);
     }
 
-    try {
-      const response = await axios.get("https://www.googleapis.com/customsearch/v1", { params });
-
-      const results: SearchResult[] = (response.data.items || []).map((item: any) => ({
-        title: item.title,
-        url: item.link,
-        snippet: item.snippet,
-        favicon: item.pagemap?.cse_thumbnail?.[0]?.src,
-        images: item.pagemap?.cse_image?.map((img: any) => img.src),
-      }));
-
-      return {
-        query,
-        results,
-        responseTime: (Date.now() - startTime) / 1000,
-        totalResults: parseInt(response.data.searchInformation?.totalResults || "0"),
-      };
-    } catch (error) {
-      throw new Error(`Google search failed: ${error}`);
+    if (options.country) {
+      params.gl = options.country.toLowerCase();
     }
+
+    const response = await axios.get("https://www.googleapis.com/customsearch/v1", { params });
+    const results: SearchResult[] = (response.data.items ?? []).map((item: any) => ({
+      title: item.title,
+      url: item.link,
+      snippet: item.snippet || "",
+      favicon: item.pagemap?.cse_thumbnail?.[0]?.src,
+      images: item.pagemap?.cse_image?.map((img: any) => img.src),
+      engine: this.name,
+    }));
+
+    return finalizeEngineResponse(
+      context,
+      this.name,
+      results,
+      Number.parseInt(response.data.searchInformation?.totalResults ?? "0", 10)
+    );
   }
 }
 
@@ -164,229 +156,171 @@ export class DuckDuckGoSearchEngine implements SearchEngine {
   name = "duckduckgo";
 
   async search(query: string, options: SearchOptions = {}): Promise<SearchResponse> {
-    const startTime = Date.now();
-    const { maxResults = 10 } = options;
+    const context = createSearchContext(query, options);
+    const response = await axios.get("https://api.duckduckgo.com/", {
+      params: {
+        q: context.providerQuery,
+        format: "json",
+        no_html: 1,
+        skip_disambig: 1,
+      },
+    });
 
-    try {
-      const response = await axios.get("https://api.duckduckgo.com/", {
-        params: {
-          q: query,
-          format: "json",
-          no_html: 1,
-          skip_disambig: 1,
-        },
+    const results: SearchResult[] = [];
+
+    if (response.data.AbstractText && response.data.AbstractURL) {
+      results.push({
+        title: response.data.Heading || query,
+        url: response.data.AbstractURL,
+        snippet: response.data.AbstractText,
+        engine: this.name,
       });
+    }
 
-      const results: SearchResult[] = [];
-
-      if (response.data.AbstractText) {
+    for (const topic of flattenDuckDuckGoTopics(response.data.RelatedTopics ?? [])) {
+      if (topic.FirstURL && topic.Text) {
         results.push({
-          title: response.data.Heading || query,
-          url: response.data.AbstractURL,
-          snippet: response.data.AbstractText,
+          title: topic.Text.split(" - ")[0] || topic.Text.substring(0, 80),
+          url: topic.FirstURL,
+          snippet: topic.Text,
+          engine: this.name,
         });
       }
-
-      (response.data.RelatedTopics || []).slice(0, maxResults - results.length).forEach((topic: any) => {
-        if (topic.FirstURL && topic.Text) {
-          results.push({
-            title: topic.Text.split(" - ")[0] || topic.Text.substring(0, 50),
-            url: topic.FirstURL,
-            snippet: topic.Text,
-          });
-        }
-      });
-
-      return {
-        query,
-        results,
-        responseTime: (Date.now() - startTime) / 1000,
-      };
-    } catch (error) {
-      throw new Error(`DuckDuckGo search failed: ${error}`);
     }
+
+    return finalizeEngineResponse(context, this.name, results);
   }
 }
 
 export class BraveSearchEngine implements SearchEngine {
   name = "brave";
-  private apiKey: string;
 
-  constructor(apiKey: string) {
-    this.apiKey = apiKey;
-  }
+  constructor(private apiKey: string) {}
 
   async search(query: string, options: SearchOptions = {}): Promise<SearchResponse> {
-    const startTime = Date.now();
-    const { maxResults = 10, timeRange, country } = options;
-
-    const params: any = {
-      q: query,
-      count: maxResults,
+    const context = createSearchContext(query, options);
+    const topicProfile = getSearchTopicProfile(options.topic);
+    const endpoint = topicProfile.nativeCategory === "news"
+      ? "https://api.search.brave.com/res/v1/news/search"
+      : "https://api.search.brave.com/res/v1/web/search";
+    const params: Record<string, unknown> = {
+      q: context.providerQuery,
+      count: Math.min(context.options.maxResults ?? 10, 20),
     };
 
-    if (timeRange) {
-      switch (timeRange) {
-        case "day": params.freshness = "pd"; break;
-        case "week": params.freshness = "pw"; break;
-        case "month": params.freshness = "pm"; break;
-        case "year": params.freshness = "py"; break;
-      }
+    const freshness = mapBraveFreshness(options.timeRange);
+    if (freshness) {
+      params.freshness = freshness;
     }
 
-    if (country) {
-      params.country = country;
+    if (options.country) {
+      params.country = options.country.toUpperCase();
     }
 
-    try {
-      const response = await axios.get("https://api.search.brave.com/res/v1/web/search", {
-        headers: {
-          "Accept": "application/json",
-          "Accept-Encoding": "gzip",
-          "X-Subscription-Token": this.apiKey,
-        },
-        params,
-      });
+    const response = await axios.get(endpoint, {
+      headers: {
+        "Accept": "application/json",
+        "Accept-Encoding": "gzip",
+        "X-Subscription-Token": this.apiKey,
+      },
+      params,
+    });
 
-      const results: SearchResult[] = (response.data.web?.results || []).map((item: any) => ({
-        title: item.title,
-        url: item.url,
-        snippet: item.description,
-        favicon: item.meta_url?.favicon,
-        publishedDate: item.age,
-      }));
+    const items = response.data.web?.results ?? response.data.results ?? response.data.news?.results ?? [];
+    const results: SearchResult[] = items.map((item: any) => ({
+      title: item.title,
+      url: item.url,
+      snippet: item.description || item.snippet || "",
+      favicon: item.meta_url?.favicon,
+      publishedDate: item.age || item.page_age,
+      images: item.thumbnail?.src ? [item.thumbnail.src] : undefined,
+      engine: this.name,
+    }));
 
-      return {
-        query,
-        results,
-        responseTime: (Date.now() - startTime) / 1000,
-        totalResults: response.data.web?.totalResults,
-      };
-    } catch (error) {
-      throw new Error(`Brave search failed: ${error}`);
-    }
+    return finalizeEngineResponse(context, this.name, results, response.data.web?.totalResults);
   }
 }
 
 export class SerpApiSearchEngine implements SearchEngine {
   name = "serpapi";
-  private apiKey: string;
 
-  constructor(apiKey: string) {
-    this.apiKey = apiKey;
-  }
+  constructor(private apiKey: string) {}
 
   async search(query: string, options: SearchOptions = {}): Promise<SearchResponse> {
-    const startTime = Date.now();
-    const { maxResults = 10, timeRange, country, includeDomains, excludeDomains } = options;
-
-    const params: any = {
+    const context = createSearchContext(query, options);
+    const params: Record<string, unknown> = {
       api_key: this.apiKey,
-      q: query,
+      q: context.providerQuery,
       engine: "google",
-      num: maxResults,
+      num: Math.min(context.options.maxResults ?? 10, 100),
     };
 
-    if (country) {
-      params.gl = country;
+    if (options.country) {
+      params.gl = options.country.toLowerCase();
     }
 
+    const timeRange = mapSerpApiTimeRange(options.timeRange);
     if (timeRange) {
-      switch (timeRange) {
-        case "day": params.tbs = "qdr:d"; break;
-        case "week": params.tbs = "qdr:w"; break;
-        case "month": params.tbs = "qdr:m"; break;
-        case "year": params.tbs = "qdr:y"; break;
-      }
+      params.tbs = timeRange;
     }
 
-    if (includeDomains?.length) {
-      params.q += ` site:${includeDomains.join(" OR site:")}`;
-    }
+    const response = await axios.get("https://serpapi.com/search", { params });
+    const results: SearchResult[] = (response.data.organic_results ?? []).map((item: any) => ({
+      title: item.title,
+      url: item.link,
+      snippet: item.snippet || "",
+      favicon: item.favicon,
+      publishedDate: item.date,
+      score: item.position,
+      engine: this.name,
+    }));
+    const answer = response.data.answer_box?.answer || response.data.answer_box?.snippet;
 
-    if (excludeDomains?.length) {
-      excludeDomains.forEach(domain => {
-        params.q += ` -site:${domain}`;
-      });
-    }
-
-    try {
-      const response = await axios.get("https://serpapi.com/search", { params });
-
-      const results: SearchResult[] = (response.data.organic_results || []).map((item: any) => ({
-        title: item.title,
-        url: item.link,
-        snippet: item.snippet,
-        favicon: item.favicon,
-        publishedDate: item.date,
-        score: item.position,
-      }));
-
-      let answer: string | undefined;
-      if (response.data.answer_box) {
-        answer = response.data.answer_box.answer || response.data.answer_box.snippet;
-      }
-
-      return {
-        query,
+    return {
+      ...finalizeEngineResponse(
+        context,
+        this.name,
         results,
-        answer,
-        responseTime: (Date.now() - startTime) / 1000,
-        totalResults: response.data.search_information?.total_results,
-      };
-    } catch (error) {
-      throw new Error(`SerpApi search failed: ${error}`);
-    }
+        response.data.search_information?.total_results
+      ),
+      answer,
+    };
   }
 }
 
 export class SearXNGSearchEngine implements SearchEngine {
   name = "searxng";
-  private baseUrl: string;
 
-  constructor(baseUrl: string) {
-    this.baseUrl = baseUrl;
-  }
+  constructor(private baseUrl: string) {}
 
   async search(query: string, options: SearchOptions = {}): Promise<SearchResponse> {
-    const startTime = Date.now();
-    const { maxResults = 10, timeRange } = options;
-
-    const params: any = {
-      q: query,
+    const context = createSearchContext(query, options);
+    const topicProfile = getSearchTopicProfile(options.topic);
+    const params: Record<string, unknown> = {
+      q: context.providerQuery,
       format: "json",
       pageno: 1,
     };
 
-    if (timeRange) {
-      switch (timeRange) {
-        case "day": params.time_range = "day"; break;
-        case "week": params.time_range = "week"; break;
-        case "month": params.time_range = "month"; break;
-        case "year": params.time_range = "year"; break;
-      }
+    if (topicProfile.nativeCategory === "news") {
+      params.categories = "news";
     }
 
-    try {
-      const response = await axios.get(`${this.baseUrl}/search`, { params });
-
-      const results: SearchResult[] = (response.data.results || []).slice(0, maxResults).map((item: any) => ({
-        title: item.title,
-        url: item.url,
-        snippet: item.content,
-        publishedDate: item.publishedDate,
-        score: item.score,
-      }));
-
-      return {
-        query,
-        results,
-        responseTime: (Date.now() - startTime) / 1000,
-        totalResults: response.data.number_of_results,
-      };
-    } catch (error) {
-      throw new Error(`SearXNG search failed: ${error}`);
+    if (options.timeRange) {
+      params.time_range = options.timeRange;
     }
+
+    const response = await axios.get(`${this.baseUrl.replace(/\/$/, "")}/search`, { params });
+    const results: SearchResult[] = (response.data.results ?? []).map((item: any) => ({
+      title: item.title,
+      url: item.url,
+      snippet: item.content || "",
+      publishedDate: item.publishedDate,
+      score: item.score,
+      engine: this.name,
+    }));
+
+    return finalizeEngineResponse(context, this.name, results, response.data.number_of_results);
   }
 }
 
@@ -395,7 +329,7 @@ export class SearchEngineManager {
   private defaultEngine: string;
 
   constructor() {
-    this.defaultEngine = "duckduckgo";
+    this.defaultEngine = process.env.DEFAULT_SEARCH_ENGINE || "duckduckgo";
     this.engines.set("duckduckgo", new DuckDuckGoSearchEngine());
 
     if (process.env.BING_API_KEY) {
@@ -420,14 +354,19 @@ export class SearchEngineManager {
     if (process.env.SEARXNG_URL) {
       this.engines.set("searxng", new SearXNGSearchEngine(process.env.SEARXNG_URL));
     }
+
+    if (!this.engines.has(this.defaultEngine)) {
+      this.defaultEngine = "duckduckgo";
+    }
   }
 
   getEngine(name?: string): SearchEngine {
     const engineName = name || this.defaultEngine;
     const engine = this.engines.get(engineName);
     if (!engine) {
-      throw new Error(`Search engine '${engineName}' not available. Available engines: ${Array.from(this.engines.keys()).join(", ")}`);
+      throw new Error(`Search engine '${engineName}' not available. Available engines: ${this.getAvailableEngines().join(", ")}`);
     }
+
     return engine;
   }
 
@@ -436,46 +375,257 @@ export class SearchEngineManager {
   }
 
   async search(query: string, options: SearchOptions & { engine?: string } = {}): Promise<SearchResponse> {
+    const requestedMaxResults = options.maxResults ?? 10;
     const engine = this.getEngine(options.engine);
-    return engine.search(query, options);
+    const response = await engine.search(query, {
+      ...options,
+      maxResults: candidateLimit(requestedMaxResults, options),
+    });
+    const filteredResults = rankResults(
+      filterResults(response.results, query, options),
+      query,
+      options
+    ).slice(0, requestedMaxResults);
+    const results = options.includeImages
+      ? filteredResults
+      : filteredResults.map(({ images, ...result }) => result);
+
+    return {
+      ...response,
+      query,
+      results,
+      images: options.includeImages ? collectImages(results) : undefined,
+      answer: options.includeAnswer ? response.answer : undefined,
+      engine: engine.name,
+    };
   }
 
   async multiSearch(query: string, options: SearchOptions & { engines?: string[] } = {}): Promise<SearchResponse> {
-    const engines = options.engines || [this.defaultEngine];
-    const searchPromises = engines.map(engineName => {
-      const engine = this.getEngine(engineName);
-      return engine.search(query, options).catch(error => ({
-        query,
-        results: [],
-        responseTime: 0,
-        error: error.message,
-      }));
-    });
+    const startedAt = Date.now();
+    const engineNames = options.engines?.length ? options.engines : [this.defaultEngine];
+    const responses = await Promise.all(engineNames.map(async engineName => {
+      try {
+        return await this.search(query, { ...options, engine: engineName });
+      } catch (error) {
+        return {
+          query,
+          results: [],
+          responseTime: 0,
+          engine: engineName,
+          errors: [{
+            engine: engineName,
+            error: error instanceof Error ? error.message : String(error),
+          }],
+        } satisfies SearchResponse;
+      }
+    }));
 
-    const responses = await Promise.all(searchPromises);
-    
     const allResults: SearchResult[] = [];
     const seenUrls = new Set<string>();
+    const errors = responses.flatMap(response => response.errors ?? []);
 
     for (const response of responses) {
-      if ('results' in response) {
-        for (const result of response.results) {
-          if (!seenUrls.has(result.url)) {
-            seenUrls.add(result.url);
-            allResults.push(result);
-          }
+      for (const result of response.results) {
+        if (!seenUrls.has(result.url)) {
+          seenUrls.add(result.url);
+          allResults.push(result);
         }
       }
     }
 
-    allResults.sort((a, b) => (b.score || 0) - (a.score || 0));
-
     return {
       query,
-      results: allResults.slice(0, options.maxResults || 20),
-      responseTime: Math.max(...responses.map(r => r.responseTime)),
+      results: allResults.slice(0, options.maxResults ?? 20),
+      images: collectImages(allResults),
+      responseTime: (Date.now() - startedAt) / 1000,
+      engines: engineNames,
+      errors: errors.length ? errors : undefined,
     };
   }
+}
+
+function createSearchContext(query: string, options: SearchOptions): SearchContext {
+  return {
+    query,
+    providerQuery: buildSearchQuery(query, options),
+    options,
+    startTime: Date.now(),
+  };
+}
+
+function finalizeEngineResponse(
+  context: SearchContext,
+  engine: string,
+  results: SearchResult[],
+  totalResults?: number
+): SearchResponse {
+  return {
+    query: context.query,
+    results: results.slice(0, context.options.maxResults ?? 10),
+    responseTime: (Date.now() - context.startTime) / 1000,
+    totalResults,
+    images: collectImages(results),
+    engine,
+  };
+}
+
+function candidateLimit(maxResults: number, options: SearchOptions): number {
+  const multiplier = candidateMultiplier(options);
+  return Math.min(Math.max(maxResults * multiplier, maxResults), 50);
+}
+
+function candidateMultiplier(options: SearchOptions): number {
+  if (hasResultFilters(options)) {
+    return 2;
+  }
+
+  switch (options.searchDepth) {
+    case "advanced":
+      return 3;
+    case "basic":
+      return 2;
+    case "fast":
+    case "ultra-fast":
+    default:
+      return 1;
+  }
+}
+
+function hasResultFilters(options: SearchOptions): boolean {
+  return Boolean(options.exactMatch || options.includeDomains?.length || options.excludeDomains?.length);
+}
+
+function filterResults(results: SearchResult[], query: string, options: SearchOptions): SearchResult[] {
+  const includeDomains = normalizeDomains(options.includeDomains);
+  const excludeDomains = normalizeDomains(options.excludeDomains);
+  const exactPhrase = query.trim().toLowerCase();
+
+  return results.filter(result => {
+    let hostname: string;
+    try {
+      hostname = new URL(result.url).hostname;
+    } catch {
+      return false;
+    }
+
+    if (includeDomains.length && !matchesDomain(hostname, includeDomains)) {
+      return false;
+    }
+
+    if (excludeDomains.length && matchesDomain(hostname, excludeDomains)) {
+      return false;
+    }
+
+    if (options.exactMatch) {
+      const haystack = `${result.title} ${result.snippet} ${result.url}`.toLowerCase();
+      if (!haystack.includes(exactPhrase)) {
+        return false;
+      }
+    }
+
+    return true;
+  });
+}
+
+function rankResults(results: SearchResult[], query: string, options: SearchOptions): SearchResult[] {
+  if (options.searchDepth === "ultra-fast") {
+    return results;
+  }
+
+  return [...results].sort((a, b) => {
+    const scoreA = combinedResultScore(a, query, options);
+    const scoreB = combinedResultScore(b, query, options);
+    return scoreB - scoreA;
+  });
+}
+
+function combinedResultScore(result: SearchResult, query: string, options: SearchOptions): number {
+  const relevanceScore = scoreTextRelevance(query, [
+    { text: result.title, weight: 0.45 },
+    { text: result.snippet, weight: 0.35 },
+    { text: result.url, weight: 0.2 },
+  ]);
+  const topicTerms = getSearchTopicProfile(options.topic).rankingTerms;
+  const topicScore = topicTerms.length > 0
+    ? scoreTextRelevance(topicTerms.join(" "), [
+      { text: result.title, weight: 0.5 },
+      { text: result.snippet, weight: 0.35 },
+      { text: result.url, weight: 0.15 },
+    ])
+    : 0;
+  const providerScore = result.score ? 1 / Math.max(result.score, 1) : 0;
+
+  if (options.searchDepth === "advanced") {
+    return (relevanceScore * 0.75) + (topicScore * 0.1) + (providerScore * 0.15);
+  }
+
+  return (relevanceScore * 0.65) + (topicScore * 0.05) + (providerScore * 0.3);
+}
+
+function collectImages(results: SearchResult[]): string[] | undefined {
+  const images = Array.from(new Set(results.flatMap(result => result.images ?? [])));
+  return images.length ? images : undefined;
+}
+
+function mapBingFreshness(timeRange?: SearchOptions["timeRange"]): string | undefined {
+  switch (timeRange) {
+    case "day": return "Day";
+    case "week": return "Week";
+    case "month": return "Month";
+    case "year": return "Year";
+    default: return undefined;
+  }
+}
+
+function mapGoogleDateRestrict(timeRange?: SearchOptions["timeRange"]): string | undefined {
+  switch (timeRange) {
+    case "day": return "d1";
+    case "week": return "w1";
+    case "month": return "m1";
+    case "year": return "y1";
+    default: return undefined;
+  }
+}
+
+function buildGoogleDateSort(startDate?: string, endDate?: string): string | undefined {
+  const start = startDate?.replace(/-/g, "") ?? "";
+  const end = endDate?.replace(/-/g, "") ?? "";
+
+  if (!start && !end) {
+    return undefined;
+  }
+
+  return `date:r:${start}:${end}`;
+}
+
+function mapBraveFreshness(timeRange?: SearchOptions["timeRange"]): string | undefined {
+  switch (timeRange) {
+    case "day": return "pd";
+    case "week": return "pw";
+    case "month": return "pm";
+    case "year": return "py";
+    default: return undefined;
+  }
+}
+
+function mapSerpApiTimeRange(timeRange?: SearchOptions["timeRange"]): string | undefined {
+  switch (timeRange) {
+    case "day": return "qdr:d";
+    case "week": return "qdr:w";
+    case "month": return "qdr:m";
+    case "year": return "qdr:y";
+    default: return undefined;
+  }
+}
+
+function flattenDuckDuckGoTopics(topics: any[]): any[] {
+  return topics.flatMap(topic => {
+    if (Array.isArray(topic.Topics)) {
+      return flattenDuckDuckGoTopics(topic.Topics);
+    }
+
+    return [topic];
+  });
 }
 
 export const searchEngineManager = new SearchEngineManager();

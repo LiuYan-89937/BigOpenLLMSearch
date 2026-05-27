@@ -1,7 +1,14 @@
-import { searchEngineManager, SearchOptions, SearchResponse } from "./search-engines.js";
-import { contentExtractor, ExtractedContent } from "./content-extractor.js";
+import { searchEngineManager, SearchOptions } from "./search-engines.js";
+import { contentExtractor } from "./content-extractor.js";
+import {
+  extractKeyPhrases,
+  generateExtractiveAnswer,
+  scoreTextRelevance,
+} from "../utils/text-analysis.js";
+import { answerGenerator } from "./answer-generator.js";
 
 export interface SemanticSearchOptions extends SearchOptions {
+  engine?: string;
   extractContent?: boolean;
   maxContentLength?: number;
   relevanceThreshold?: number;
@@ -14,6 +21,7 @@ export interface SemanticSearchResult {
   content?: string;
   relevanceScore: number;
   keyPhrases: string[];
+  engine?: string;
 }
 
 export interface SemanticSearchResponse {
@@ -29,7 +37,7 @@ export class SemanticSearch {
     const {
       extractContent = false,
       maxContentLength = 2000,
-      relevanceThreshold = 0.3,
+      relevanceThreshold = 0.25,
       maxResults = 10,
       ...searchOptions
     } = options;
@@ -39,39 +47,60 @@ export class SemanticSearch {
       maxResults: maxResults * 2,
     });
 
-    let results = searchResponse.results.map(result => ({
+    let results: SemanticSearchResult[] = searchResponse.results.map(result => ({
       title: result.title,
       url: result.url,
       snippet: result.snippet,
-      relevanceScore: this.calculateRelevance(query, result.title, result.snippet),
-      keyPhrases: this.extractKeyPhrases(result.snippet),
+      relevanceScore: scoreTextRelevance(query, [
+        { text: result.title, weight: 0.45 },
+        { text: result.snippet, weight: 0.35 },
+        { text: result.url, weight: 0.2 },
+      ]),
+      keyPhrases: extractKeyPhrases(`${result.title} ${result.snippet}`),
+      engine: result.engine,
     }));
 
-    results = results.filter(r => r.relevanceScore >= relevanceThreshold);
-    results.sort((a, b) => b.relevanceScore - a.relevanceScore);
-    results = results.slice(0, maxResults);
-
-    if (extractContent) {
-      const urls = results.map(r => r.url);
-      const contents = await contentExtractor.extractMultiple(urls, {
+    if (extractContent && results.length > 0) {
+      const contents = await contentExtractor.extractMultiple(results.map(result => result.url), {
         format: "text",
         extractDepth: "basic",
       });
+      const contentMap = new Map(contents.map(content => [content.url, content.content]));
 
-      const contentMap = new Map(contents.map(c => [c.url, c.content]));
+      results = results.map(result => {
+        const content = contentMap.get(result.url);
+        const contentSnippet = content?.substring(0, maxContentLength);
+        const relevanceScore = scoreTextRelevance(query, [
+          { text: result.title, weight: 0.35 },
+          { text: result.snippet, weight: 0.25 },
+          { text: contentSnippet, weight: 0.4 },
+        ]);
 
-      results = results.map(result => ({
-        ...result,
-        content: contentMap.get(result.url)?.substring(0, maxContentLength),
-      }));
+        return {
+          ...result,
+          content: contentSnippet,
+          relevanceScore,
+          keyPhrases: extractKeyPhrases(`${result.title} ${result.snippet} ${contentSnippet ?? ""}`),
+        };
+      });
     }
 
-    let answer: string | undefined;
-    if (searchResponse.answer) {
-      answer = searchResponse.answer;
-    } else if (results.length > 0) {
-      answer = this.generateSummary(query, results.slice(0, 3));
-    }
+    results = results
+      .filter(result => result.relevanceScore >= relevanceThreshold)
+      .sort((a, b) => b.relevanceScore - a.relevanceScore)
+      .slice(0, maxResults);
+
+    const fallbackAnswer = searchResponse.answer || (results.length
+      ? generateExtractiveAnswer(query, results, "plain")
+      : undefined);
+    const answer = options.includeAnswer && fallbackAnswer
+      ? await answerGenerator.generate({
+        query,
+        sources: results,
+        format: "plain",
+        fallbackAnswer,
+      })
+      : undefined;
 
     return {
       query,
@@ -79,100 +108,6 @@ export class SemanticSearch {
       answer,
       responseTime: (Date.now() - startTime) / 1000,
     };
-  }
-
-  private calculateRelevance(query: string, title: string, snippet: string): number {
-    const queryTerms = query.toLowerCase().split(/\s+/).filter(t => t.length > 2);
-    const titleLower = title.toLowerCase();
-    const snippetLower = snippet.toLowerCase();
-
-    let score = 0;
-    let matchedTerms = 0;
-
-    for (const term of queryTerms) {
-      if (titleLower.includes(term)) {
-        score += 0.4;
-        matchedTerms++;
-      }
-      if (snippetLower.includes(term)) {
-        score += 0.3;
-        matchedTerms++;
-      }
-    }
-
-    const termMatchRatio = matchedTerms / queryTerms.length;
-    score += termMatchRatio * 0.3;
-
-    return Math.min(score, 1);
-  }
-
-  private extractKeyPhrases(text: string): string[] {
-    const words = text.toLowerCase().split(/\s+/);
-    const stopWords = new Set([
-      "the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for",
-      "of", "with", "by", "from", "is", "are", "was", "were", "be", "been",
-      "being", "have", "has", "had", "do", "does", "did", "will", "would",
-      "could", "should", "may", "might", "can", "this", "that", "these",
-      "those", "i", "you", "he", "she", "it", "we", "they", "what", "which",
-      "who", "whom", "when", "where", "why", "how", "all", "each", "every",
-      "both", "few", "more", "most", "other", "some", "such", "no", "not",
-      "only", "own", "same", "so", "than", "too", "very", "just", "because",
-      "as", "until", "while", "of", "during", "before", "after", "above",
-      "below", "between", "through", "during", "before", "after", "above",
-      "below", "between",
-    ]);
-
-    const phrases: string[] = [];
-    let currentPhrase: string[] = [];
-
-    for (const word of words) {
-      const cleanWord = word.replace(/[^a-z0-9]/g, "");
-      if (cleanWord.length > 2 && !stopWords.has(cleanWord)) {
-        currentPhrase.push(cleanWord);
-      } else {
-        if (currentPhrase.length >= 2) {
-          phrases.push(currentPhrase.join(" "));
-        }
-        currentPhrase = [];
-      }
-    }
-
-    if (currentPhrase.length >= 2) {
-      phrases.push(currentPhrase.join(" "));
-    }
-
-    const phraseCounts = new Map<string, number>();
-    phrases.forEach(p => {
-      phraseCounts.set(p, (phraseCounts.get(p) || 0) + 1);
-    });
-
-    return Array.from(phraseCounts.entries())
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 5)
-      .map(([phrase]) => phrase);
-  }
-
-  private generateSummary(query: string, results: Array<{ title: string; snippet: string }>): string {
-    const snippets = results.map(r => r.snippet).join(" ");
-    const sentences = snippets.split(/[.!?]+/).filter(s => s.trim().length > 30);
-    
-    const queryTerms = query.toLowerCase().split(/\s+/);
-    const relevantSentences = sentences
-      .map(sentence => ({
-        text: sentence.trim(),
-        relevance: queryTerms.filter(term => 
-          sentence.toLowerCase().includes(term)
-        ).length,
-      }))
-      .filter(s => s.relevance > 0)
-      .sort((a, b) => b.relevance - a.relevance)
-      .slice(0, 3);
-
-    if (relevantSentences.length > 0) {
-      return relevantSentences.map(s => s.text).join(". ") + ".";
-    }
-
-    return `Based on the search results for "${query}": ${results[0]?.snippet || "No relevant information found."}`;
   }
 }
 

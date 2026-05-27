@@ -1,0 +1,11 @@
+{
+  "news": {
+    "nativeCategory": "news",
+    "queryTerms": ["news", "latest", "breaking"],
+    "rankingTerms": ["news", "latest", "breaking"]
+  },
+  "finance": {
+    "queryTerms": ["finance", "financial", "market", "stock", "earnings"],
+    "rankingTerms": ["finance", "financial", "market", "stock", "earnings"]
+  }
+}

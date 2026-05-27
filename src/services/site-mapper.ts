@@ -1,5 +1,8 @@
-import axios from "axios";
+import * as cheerio from "cheerio";
+import { fetchText } from "../utils/http-client.js";
 import { parseHtml } from "../utils/html-parser.js";
+import { createInstructionMatcher } from "../utils/text-analysis.js";
+import { matchesDomain, normalizeHttpUrl } from "../utils/url-policy.js";
 
 export interface MapOptions {
   maxDepth?: number;
@@ -24,162 +27,228 @@ export interface SiteMapResult {
   startUrl: string;
   pages: SiteMapEntry[];
   totalPages: number;
+  errors: Array<{ url: string; error: string }>;
+}
+
+interface MapQueueItem {
+  url: string;
+  depth: number;
+}
+
+interface MapContext extends Required<Pick<MapOptions, "maxDepth" | "maxBreadth" | "limit" | "allowExternal">> {
+  selectPaths?: string[];
+  selectDomains?: string[];
+  excludePaths?: string[];
+  excludeDomains?: string[];
+  startDomain: string;
+  instructionMatcher: ReturnType<typeof createInstructionMatcher>;
 }
 
 export class SiteMapper {
-  private visited = new Set<string>();
-  private userAgent = "Mozilla/5.0 (compatible; WebSearchMCP/1.0)";
-
   async map(startUrl: string, options: MapOptions = {}): Promise<SiteMapResult> {
-    const {
-      maxDepth = 2,
-      maxBreadth = 20,
-      limit = 100,
-      selectPaths,
-      selectDomains,
-      excludePaths,
-      excludeDomains,
-      allowExternal = false,
-    } = options;
+    const normalizedStartUrl = normalizeHttpUrl(startUrl);
+    if (!normalizedStartUrl) {
+      throw new Error(`Invalid start URL: ${startUrl}`);
+    }
 
-    this.visited.clear();
+    const context: MapContext = {
+      maxDepth: options.maxDepth ?? 2,
+      maxBreadth: options.maxBreadth ?? 20,
+      limit: options.limit ?? 100,
+      selectPaths: options.selectPaths,
+      selectDomains: options.selectDomains,
+      excludePaths: options.excludePaths,
+      excludeDomains: options.excludeDomains,
+      allowExternal: options.allowExternal ?? false,
+      startDomain: new URL(normalizedStartUrl).hostname,
+      instructionMatcher: createInstructionMatcher(options.instructions),
+    };
+    const visited = new Set<string>();
     const pages: SiteMapEntry[] = [];
-    const queue: Array<{ url: string; depth: number }> = [{ url: startUrl, depth: 0 }];
+    const errors: Array<{ url: string; error: string }> = [];
+    const queue: MapQueueItem[] = [{ url: normalizedStartUrl, depth: 0 }];
 
-    const startDomain = new URL(startUrl).hostname;
+    while (queue.length > 0 && pages.length < context.limit) {
+      const batch = takeBatch(queue, visited, context);
+      if (batch.length === 0) {
+        continue;
+      }
 
-    while (queue.length > 0 && pages.length < limit) {
-      const batch = queue.splice(0, Math.min(maxBreadth, 5));
-      
-      const promises = batch.map(async ({ url, depth }) => {
-        if (this.visited.has(url)) return;
-        if (depth > maxDepth) return;
-        if (pages.length >= limit) return;
-
-        const urlObj = new URL(url);
-        const domain = urlObj.hostname;
-
-        if (!allowExternal && domain !== startDomain) return;
-
-        if (excludeDomains?.some(d => domain.includes(d))) return;
-        if (selectDomains?.length && !selectDomains.some(d => domain.includes(d))) return;
-
-        const path = urlObj.pathname;
-        if (excludePaths?.some(p => path.includes(p))) return;
-        if (selectPaths?.length && !selectPaths.some(p => path.includes(p))) return;
-
-        this.visited.add(url);
-
-        try {
-          const entry = await this.fetchPageInfo(url, depth);
-          pages.push(entry);
-
-          if (depth < maxDepth) {
-            const links = await this.extractLinks(url);
-            const newLinks = links
-              .filter(link => !this.visited.has(link))
-              .slice(0, maxBreadth);
-
-            for (const link of newLinks) {
-              queue.push({ url: link, depth: depth + 1 });
-            }
-          }
-        } catch (error) {
-          console.error(`Failed to fetch ${url}:`, error);
+      const fetchedPages = await Promise.all(batch.map(item => this.fetchPageInfo(item)));
+      for (const result of fetchedPages) {
+        if ("error" in result) {
+          errors.push(result.error);
+          continue;
         }
-      });
 
-      await Promise.all(promises);
+        if (pages.length >= context.limit) {
+          break;
+        }
+
+        pages.push(result.entry);
+
+        if (result.entry.depth < context.maxDepth) {
+          queue.push(...rankLinks(result.links, context)
+            .filter(link => !visited.has(link.url))
+            .slice(0, context.maxBreadth)
+            .map(link => ({ url: link.url, depth: result.entry.depth + 1 })));
+        }
+      }
     }
 
     return {
-      startUrl,
+      startUrl: normalizedStartUrl,
       pages,
       totalPages: pages.length,
+      errors,
     };
-  }
-
-  private async fetchPageInfo(url: string, depth: number): Promise<SiteMapEntry> {
-    const response = await axios.get(url, {
-      headers: { "User-Agent": this.userAgent },
-      timeout: 15000,
-      maxRedirects: 3,
-    });
-
-    const parsed = parseHtml(response.data, url);
-
-    return {
-      url,
-      title: parsed.title,
-      description: parsed.description,
-      depth,
-    };
-  }
-
-  private async extractLinks(url: string): Promise<string[]> {
-    try {
-      const response = await axios.get(url, {
-        headers: { "User-Agent": this.userAgent },
-        timeout: 15000,
-        maxRedirects: 3,
-      });
-
-      const parsed = parseHtml(response.data, url);
-      
-      return parsed.links
-        .map(link => {
-          try {
-            return new URL(link.href, url).href;
-          } catch {
-            return null;
-          }
-        })
-        .filter((link): link is string => link !== null);
-    } catch {
-      return [];
-    }
   }
 
   async discoverSitemap(baseUrl: string): Promise<string[]> {
-    const sitemapUrls = [
-      `${baseUrl}/sitemap.xml`,
-      `${baseUrl}/sitemap_index.xml`,
-      `${baseUrl}/sitemap-index.xml`,
-      `${baseUrl}/sitemap.txt`,
-    ];
+    const normalizedBaseUrl = normalizeHttpUrl(baseUrl);
+    if (!normalizedBaseUrl) {
+      throw new Error(`Invalid base URL: ${baseUrl}`);
+    }
 
-    const discoveredUrls: string[] = [];
+    const origin = new URL(normalizedBaseUrl).origin;
+    const sitemapUrls = [
+      `${origin}/sitemap.xml`,
+      `${origin}/sitemap_index.xml`,
+      `${origin}/sitemap-index.xml`,
+      `${origin}/sitemap.txt`,
+    ];
+    const discoveredUrls = new Set<string>();
 
     for (const sitemapUrl of sitemapUrls) {
       try {
-        const response = await axios.get(sitemapUrl, {
-          headers: { "User-Agent": this.userAgent },
-          timeout: 10000,
+        const response = await fetchText(sitemapUrl, {
+          timeoutMs: 10000,
+          maxRedirects: 3,
+          allowedContentTypes: [
+            "application/xml",
+            "text/xml",
+            "text/plain",
+            "text/html",
+          ],
         });
 
-        if (response.status === 200) {
-          const content = response.data;
-          
-          if (typeof content === "string" && content.includes("<?xml")) {
-            const urlMatches = content.match(/<loc>(.*?)<\/loc>/g);
-            if (urlMatches) {
-              urlMatches.forEach((match: string) => {
-                const url = match.replace(/<\/?loc>/g, "");
-                discoveredUrls.push(url);
-              });
-            }
-          } else if (typeof content === "string") {
-            const urls = content.split("\n").filter((line: string) => line.trim().startsWith("http"));
-            discoveredUrls.push(...urls);
-          }
+        for (const url of extractSitemapLocations(response.body)) {
+          discoveredUrls.add(url);
         }
       } catch {
         continue;
       }
     }
 
-    return discoveredUrls;
+    return Array.from(discoveredUrls);
   }
+
+  private async fetchPageInfo(
+    item: MapQueueItem
+  ): Promise<{ entry: SiteMapEntry; links: Array<{ url: string; text: string }> } | { error: { url: string; error: string } }> {
+    try {
+      const response = await fetchText(item.url, {
+        timeoutMs: 15000,
+        maxRedirects: 3,
+      });
+      const parsed = parseHtml(response.body, response.url);
+      const links = parsed.links
+        .map(link => ({
+          url: normalizeHttpUrl(link.href, response.url),
+          text: link.text,
+        }))
+        .filter((link): link is { url: string; text: string } => Boolean(link.url));
+
+      return {
+        entry: {
+          url: item.url,
+          title: parsed.title,
+          description: parsed.description,
+          depth: item.depth,
+        },
+        links,
+      };
+    } catch (error) {
+      return {
+        error: {
+          url: item.url,
+          error: error instanceof Error ? error.message : String(error),
+        },
+      };
+    }
+  }
+}
+
+function takeBatch(queue: MapQueueItem[], visited: Set<string>, context: MapContext): MapQueueItem[] {
+  const batch: MapQueueItem[] = [];
+
+  while (queue.length > 0 && batch.length < Math.min(context.maxBreadth, 5)) {
+    const item = queue.shift();
+    if (!item || visited.has(item.url) || item.depth > context.maxDepth) {
+      continue;
+    }
+
+    if (!shouldVisitUrl(item.url, context)) {
+      continue;
+    }
+
+    visited.add(item.url);
+    batch.push(item);
+  }
+
+  return batch;
+}
+
+function shouldVisitUrl(url: string, context: MapContext): boolean {
+  const parsed = new URL(url);
+  if (!context.allowExternal && parsed.hostname !== context.startDomain) {
+    return false;
+  }
+
+  if (context.excludeDomains?.length && matchesDomain(parsed.hostname, context.excludeDomains)) {
+    return false;
+  }
+
+  if (context.selectDomains?.length && !matchesDomain(parsed.hostname, context.selectDomains)) {
+    return false;
+  }
+
+  if (context.excludePaths?.some(path => parsed.pathname.includes(path))) {
+    return false;
+  }
+
+  if (context.selectPaths?.length && !context.selectPaths.some(path => parsed.pathname.includes(path))) {
+    return false;
+  }
+
+  return true;
+}
+
+function rankLinks(
+  links: Array<{ url: string; text: string }>,
+  context: MapContext
+): Array<{ url: string; text: string }> {
+  if (!context.instructionMatcher.hasInstructions) {
+    return links;
+  }
+
+  return [...links].sort((a, b) => {
+    const scoreA = context.instructionMatcher.score(`${a.text} ${a.url}`);
+    const scoreB = context.instructionMatcher.score(`${b.text} ${b.url}`);
+    return scoreB - scoreA;
+  });
+}
+
+function extractSitemapLocations(content: string): string[] {
+  if (content.trim().startsWith("<")) {
+    const $ = cheerio.load(content, { xmlMode: true });
+    return $("loc").map((_, element) => $(element).text().trim()).get().filter(Boolean);
+  }
+
+  return content
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(line => line.startsWith("http://") || line.startsWith("https://"));
 }
 
 export const siteMapper = new SiteMapper();

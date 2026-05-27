@@ -77,6 +77,20 @@ export function parseHtml(html: string, url?: string): ParsedContent {
     }
   });
 
+  $("link[rel][href]").each((_, el) => {
+    const rel = $(el).attr("rel")?.toLowerCase();
+    const href = $(el).attr("href");
+    if (!rel || !href) {
+      return;
+    }
+
+    try {
+      metadata[rel] = url ? new URL(href, url).href : href;
+    } catch {
+      metadata[rel] = href;
+    }
+  });
+
   const bodyHtml = $("body").html() || "";
   const markdown = turndownService.turndown(bodyHtml);
   const text = $("body").text().replace(/\s+/g, " ").trim();

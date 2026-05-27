@@ -1,9 +1,10 @@
 import { z } from "zod";
 import { contentExtractor, ExtractOptions } from "../services/content-extractor.js";
 import { contentCache } from "../utils/cache.js";
+import { parseToolInput } from "../utils/tool-input.js";
 
 const ExtractInputSchema = z.object({
-  urls: z.union([z.string(), z.array(z.string())]).describe("One or more URLs to extract content from"),
+  urls: z.union([z.string().url(), z.array(z.string().url())]).describe("One or more URLs to extract content from"),
   extract_depth: z.enum(["basic", "advanced"]).default("basic").describe(
     "'advanced' for more detailed extraction with chunks, 'basic' for faster extraction"
   ),
@@ -57,7 +58,8 @@ export const extractToolDefinition = {
 };
 
 export class ExtractTool {
-  static async execute(input: ExtractInput) {
+  static async execute(rawInput: unknown) {
+    const input = parseToolInput(ExtractInputSchema, rawInput);
     const urls = Array.isArray(input.urls) ? input.urls : [input.urls];
     
     const cacheKey = JSON.stringify(input);
