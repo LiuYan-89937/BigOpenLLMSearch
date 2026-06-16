@@ -16,17 +16,19 @@
 
 ## 快速开始
 
-### 1. 安装
+### 1. 安装 / 运行
 
 ```bash
-# 克隆项目
+# npm 包发布后，MCP 客户端可直接通过 npx 启动
+npx -y bigopen-llm-search
+```
+
+本地开发时再克隆仓库：
+
+```bash
 git clone <repository-url>
 cd WebSearchApi
-
-# 安装依赖
 npm install
-
-# 构建项目
 npm run build
 ```
 
@@ -38,16 +40,25 @@ npm run build
 cp .env.example .env
 ```
 
-编辑 `.env` 文件，填入你的 API Key：
+编辑 `.env` 文件，填入你的搜索引擎配置。推荐使用自建 SearXNG，也可以让 MCP 自动拉起本地 Docker 容器：
 
 ```env
-# 必填：选择至少一个搜索引擎
+# 方案一：已有 SearXNG 实例；配置后默认使用 SearXNG
+SEARXNG_URL=http://127.0.0.1:8888
+
+# 方案二：没有现成实例时，让 MCP 在首次搜索前自动拉起本地 Docker 容器
+SEARXNG_AUTO_START=true
+SEARXNG_DOCKER_PORT=8888
+
+# 可选：显式指定搜索引擎；不配置时，存在 SEARXNG_URL 或 SEARXNG_AUTO_START=true 就使用 searxng，否则使用 duckduckgo
+DEFAULT_SEARCH_ENGINE=searxng
+
+# 可选：商业搜索 API
 BING_API_KEY=你的Bing密钥
 GOOGLE_API_KEY=你的Google密钥
 GOOGLE_SEARCH_ENGINE_ID=你的Google搜索引擎ID
 BRAVE_API_KEY=你的Brave密钥
 SERPAPI_API_KEY=你的SerpApi密钥
-SEARXNG_URL=https://你的SearXNG实例地址
 
 # 可选：启用 include_answer / web_research 的 AI 生成答案
 LLM_API_KEY=你的OpenAI兼容接口密钥
@@ -55,7 +66,8 @@ LLM_MODEL=你的模型名
 LLM_BASE_URL=https://你的OpenAI兼容接口/v1
 ```
 
-> **提示**：DuckDuckGo 无需 API Key，默认可用。如果未配置其他引擎，将使用 DuckDuckGo。
+> **提示**：SearXNG 是推荐默认搜索引擎。配置 `SEARXNG_URL` 或 `SEARXNG_AUTO_START=true` 后，服务会自动优先使用 SearXNG；未配置任何搜索服务时，降级为 DuckDuckGo。
+> **自动 Docker**：`SEARXNG_AUTO_START=true` 需要本机已安装并启动 Docker。服务会创建/复用名为 `bigopen-llm-search-searxng` 的容器，并在 `~/.bigopen-llm-search/searxng/config/settings.yml` 生成启用 `json` 输出的 SearXNG 配置。
 > **AI 答案**：`LLM_API_KEY` 和 `LLM_MODEL` 同时存在时，`include_answer` 与 `web_research` 会调用 OpenAI 兼容接口生成带来源约束的答案；未配置时会自动降级为基于搜索结果/正文的抽取式摘要。
 > **Topic 策略**：`topic` 的查询扩展词和重排词集中放在 `config/search-topics.json`，不要在搜索代码里为具体关键词加特例。
 
@@ -75,12 +87,10 @@ npm start
 {
   "mcpServers": {
     "web-search": {
-      "command": "node",
-      "args": ["/你的路径/WebSearchApi/dist/index.js"],
+      "command": "npx",
+      "args": ["-y", "bigopen-llm-search"],
       "env": {
-        "BING_API_KEY": "你的Bing密钥",
-        "GOOGLE_API_KEY": "你的Google密钥",
-        "GOOGLE_SEARCH_ENGINE_ID": "你的搜索引擎ID"
+        "SEARXNG_AUTO_START": "true"
       }
     }
   }
@@ -95,9 +105,11 @@ npm start
 {
   "mcpServers": {
     "web-search": {
-      "command": "node",
-      "args": ["/你的路径/WebSearchApi/dist/index.js"],
-      "env": {}
+      "command": "npx",
+      "args": ["-y", "bigopen-llm-search"],
+      "env": {
+        "SEARXNG_AUTO_START": "true"
+      }
     }
   }
 }

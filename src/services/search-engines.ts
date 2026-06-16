@@ -4,6 +4,11 @@ import { scoreTextRelevance } from "../utils/text-analysis.js";
 import { matchesDomain } from "../utils/url-policy.js";
 import { loadEnvFile } from "../utils/env.js";
 import { getSearchTopicProfile, SearchTopic } from "../config/search-topics.js";
+import {
+  ensureSearXNGRuntime,
+  isSearXNGAutoStartEnabled,
+  resolveSearXNGBaseUrl,
+} from "./searxng-runtime.js";
 
 loadEnvFile();
 
@@ -329,7 +334,6 @@ export class SearchEngineManager {
   private defaultEngine: string;
 
   constructor() {
-    this.defaultEngine = process.env.DEFAULT_SEARCH_ENGINE || "duckduckgo";
     this.engines.set("duckduckgo", new DuckDuckGoSearchEngine());
 
     if (process.env.BING_API_KEY) {
@@ -351,13 +355,11 @@ export class SearchEngineManager {
       this.engines.set("serpapi", new SerpApiSearchEngine(process.env.SERPAPI_API_KEY));
     }
 
-    if (process.env.SEARXNG_URL) {
-      this.engines.set("searxng", new SearXNGSearchEngine(process.env.SEARXNG_URL));
+    if (process.env.SEARXNG_URL || isSearXNGAutoStartEnabled()) {
+      this.engines.set("searxng", new SearXNGSearchEngine(resolveSearXNGBaseUrl()));
     }
 
-    if (!this.engines.has(this.defaultEngine)) {
-      this.defaultEngine = "duckduckgo";
-    }
+    this.defaultEngine = selectDefaultEngine(process.env.DEFAULT_SEARCH_ENGINE, this.engines);
   }
 
   getEngine(name?: string): SearchEngine {
@@ -377,6 +379,7 @@ export class SearchEngineManager {
   async search(query: string, options: SearchOptions & { engine?: string } = {}): Promise<SearchResponse> {
     const requestedMaxResults = options.maxResults ?? 10;
     const engine = this.getEngine(options.engine);
+    await this.ensureEngineReady(engine.name);
     const response = await engine.search(query, {
       ...options,
       maxResults: candidateLimit(requestedMaxResults, options),
@@ -442,6 +445,25 @@ export class SearchEngineManager {
       errors: errors.length ? errors : undefined,
     };
   }
+
+  private async ensureEngineReady(engineName: string): Promise<void> {
+    if (engineName === "searxng") {
+      await ensureSearXNGRuntime();
+    }
+  }
+}
+
+function selectDefaultEngine(configuredEngine: string | undefined, engines: Map<string, SearchEngine>): string {
+  const normalizedEngine = configuredEngine?.trim().toLowerCase();
+  if (normalizedEngine && engines.has(normalizedEngine)) {
+    return normalizedEngine;
+  }
+
+  if (engines.has("searxng")) {
+    return "searxng";
+  }
+
+  return "duckduckgo";
 }
 
 function createSearchContext(query: string, options: SearchOptions): SearchContext {
