@@ -1,6 +1,6 @@
 # BigOpenLLMSearch
 
-一个功能强大的 MCP (Model Context Protocol) 服务器，为 LLM 提供网页搜索、内容提取、网站爬取和深度研究能力。对标 Tavily，提供全面的联网搜索解决方案。
+一个功能强大的 MCP (Model Context Protocol) 服务器，为 LLM 提供网页搜索、内容提取、网站爬取和网站地图能力。对标 Tavily，提供联网搜索解决方案。
 
 ## 功能特性
 
@@ -10,7 +10,6 @@
 | 📄 **内容提取** | 从网页中提取干净、结构化的内容 |
 | 🕷️ **网站爬取** | 递归爬取网站，支持深度和广度控制 |
 | 🗺️ **网站地图** | 全面发现网站结构和页面 |
-| 📊 **深度研究** | 多源搜索分析，生成研究报告 |
 | 🧠 **语义搜索** | 相关性评分和关键短语提取 |
 | ⚡ **结果缓存** | 内置缓存机制，提升响应速度 |
 
@@ -60,7 +59,7 @@ GOOGLE_SEARCH_ENGINE_ID=你的Google搜索引擎ID
 BRAVE_API_KEY=你的Brave密钥
 SERPAPI_API_KEY=你的SerpApi密钥
 
-# 可选：启用 include_answer / web_research 的 AI 生成答案
+# 可选：启用 include_answer 的 AI 生成答案
 LLM_API_KEY=你的OpenAI兼容接口密钥
 LLM_MODEL=你的模型名
 LLM_BASE_URL=https://你的OpenAI兼容接口/v1
@@ -68,7 +67,7 @@ LLM_BASE_URL=https://你的OpenAI兼容接口/v1
 
 > **提示**：SearXNG 是推荐默认搜索引擎。配置 `SEARXNG_URL` 或 `SEARXNG_AUTO_START=true` 后，服务会自动优先使用 SearXNG；未配置任何搜索服务时，降级为 DuckDuckGo。
 > **自动 Docker**：`SEARXNG_AUTO_START=true` 需要本机已安装并启动 Docker。服务会创建/复用名为 `bigopen-llm-search-searxng` 的容器，并在 `~/.bigopen-llm-search/searxng/config/settings.yml` 生成启用 `json` 输出的 SearXNG 配置。
-> **AI 答案**：`LLM_API_KEY` 和 `LLM_MODEL` 同时存在时，`include_answer` 与 `web_research` 会调用 OpenAI 兼容接口生成带来源约束的答案；未配置时会自动降级为基于搜索结果/正文的抽取式摘要。
+> **AI 答案**：`LLM_API_KEY` 和 `LLM_MODEL` 同时存在时，`include_answer` 会调用 OpenAI 兼容接口生成带来源约束的答案；未配置时会自动降级为基于搜索结果/正文的抽取式摘要。
 > **Topic 策略**：`topic` 的查询扩展词和重排词集中放在 `config/search-topics.json`，不要在搜索代码里为具体关键词加特例。
 
 ### 3. 启动服务
@@ -237,33 +236,6 @@ npm start
 }
 ```
 
-### 5. web_research - 深度研究
-
-对特定主题进行全面研究。
-
-**参数说明：**
-
-| 参数 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `query` | string | 必填 | 研究问题或主题 |
-| `max_sources` | number | 10 | 最大来源数 (3-20) |
-| `search_depth` | string | "advanced" | 搜索深度：`basic`/`advanced` |
-| `include_answer` | boolean | true | 是否生成综合答案；配置 LLM 时为 AI 生成，否则为抽取式摘要 |
-| `output_format` | string | "report" | 输出格式：`report`/`summary`/`bullet_points` |
-| `time_range` | string | - | 时间范围过滤 |
-| `engines` | string[] | - | 使用的搜索引擎 |
-
-**使用示例：**
-
-```json
-{
-  "query": "人工智能对医疗行业的影响",
-  "max_sources": 15,
-  "output_format": "report",
-  "time_range": "year"
-}
-```
-
 ## 搜索深度对比
 
 | 深度 | 延迟 | 相关性 | 说明 |
@@ -281,7 +253,6 @@ npm start
 | 内容提取 | ✅ | ✅ 支持 markdown/text 格式 |
 | 网站爬取 | ✅ | ✅ 支持深度/广度控制 |
 | 网站地图 | ✅ | ✅ 支持路径过滤 |
-| 深度研究 | ✅ | ✅ 多源分析 + 报告生成 |
 | 语义搜索 | ✅ | ✅ 相关性评分 + 关键短语提取 |
 | 自定义搜索引擎 | ❌ | ✅ 支持多种搜索引擎 |
 | 开源免费 | ❌ | ✅ 完全开源 |
@@ -311,8 +282,7 @@ BigOpenLLMSearch/
 │   │   ├── search.ts           # 搜索工具
 │   │   ├── extract.ts          # 提取工具
 │   │   ├── crawl.ts            # 爬取工具
-│   │   ├── map.ts              # 地图工具
-│   │   └── research.ts         # 研究工具
+│   │   └── map.ts              # 地图工具
 │   ├── services/
 │   │   ├── search-engines.ts   # 搜索引擎集成
 │   │   ├── content-extractor.ts # 内容提取

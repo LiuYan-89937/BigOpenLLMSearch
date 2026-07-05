@@ -10,7 +10,6 @@ import { SearchTool, searchToolDefinition } from "./tools/search.js";
 import { ExtractTool, extractToolDefinition } from "./tools/extract.js";
 import { CrawlTool, crawlToolDefinition } from "./tools/crawl.js";
 import { MapTool, mapToolDefinition } from "./tools/map.js";
-import { ResearchTool, researchToolDefinition } from "./tools/research.js";
 
 const server = new Server(
   {
@@ -29,7 +28,6 @@ const tools = [
   extractToolDefinition,
   crawlToolDefinition,
   mapToolDefinition,
-  researchToolDefinition,
 ];
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
@@ -54,9 +52,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         break;
       case "web_map":
         result = await MapTool.execute(args);
-        break;
-      case "web_research":
-        result = await ResearchTool.execute(args);
         break;
       default:
         throw new Error(`Unknown tool: ${name}`);
