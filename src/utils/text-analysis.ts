@@ -137,18 +137,6 @@ export function generateExtractiveAnswer(
   return sentences.join(". ") + ".";
 }
 
-export function buildResearchQueries(query: string, maxQueries = 3): string[] {
-  const queries = new Set<string>([query.trim()]);
-  const terms = tokenizeMeaningfulText(query);
-
-  if (terms.length > 3) {
-    queries.add(terms.slice(0, Math.ceil(terms.length / 2)).join(" "));
-    queries.add(terms.slice(Math.floor(terms.length / 2)).join(" "));
-  }
-
-  return Array.from(queries).filter(Boolean).slice(0, maxQueries);
-}
-
 export function createInstructionMatcher(instructions?: string) {
   const terms = tokenizeMeaningfulText(instructions ?? "");
 

@@ -1,16 +1,16 @@
 # BigOpenLLMSearch
 
-一个功能强大的 MCP (Model Context Protocol) 服务器，为 LLM 提供网页搜索、内容提取、网站爬取和网站地图能力。对标 Tavily，提供联网搜索解决方案。
+一个功能强大的 MCP (Model Context Protocol) 服务器，为 LLM 提供网页搜索、内容提取、网站爬取和网站地图能力。既可直接使用 Tavily，也可组合自建和其他商业搜索 Provider。
 
 ## 功能特性
 
 | 功能 | 说明 |
 |------|------|
-| 🔍 **多引擎搜索** | 支持 Bing、Google、DuckDuckGo、Brave、SerpApi、SearXNG |
+| 🔍 **多引擎搜索** | 支持 Tavily、SearXNG、DuckDuckGo、Bing、Google、Brave、SerpApi |
 | 📄 **内容提取** | 从网页中提取干净、结构化的内容 |
 | 🕷️ **网站爬取** | 递归爬取网站，支持深度和广度控制 |
 | 🗺️ **网站地图** | 全面发现网站结构和页面 |
-| 🧠 **语义搜索** | 相关性评分和关键短语提取 |
+| 🧠 **成熟检索** | Query planning、RRF 融合、正文/向量混合重排 |
 | ⚡ **结果缓存** | 内置缓存机制，提升响应速度 |
 
 ## 快速开始
@@ -39,18 +39,23 @@ npm run build
 cp .env.example .env
 ```
 
-编辑 `.env` 文件，填入你的搜索引擎配置。推荐使用自建 SearXNG，也可以让 MCP 自动拉起本地 Docker 容器：
+编辑 `.env` 文件，填入你的搜索引擎配置。追求稳定召回时推荐 Tavily；完全自建时使用 SearXNG：
 
 ```env
-# 方案一：已有 SearXNG 实例；配置后默认使用 SearXNG
+# 方案一：Tavily；配置后默认使用 Tavily
+TAVILY_API_KEY=你的Tavily密钥
+
+# 方案二：已有 SearXNG 实例
 SEARXNG_URL=http://127.0.0.1:8888
 
-# 方案二：没有现成实例时，让 MCP 在首次搜索前自动拉起本地 Docker 容器
+# 方案三：没有现成实例时，让 MCP 在首次搜索前自动拉起本地 Docker 容器
 SEARXNG_AUTO_START=true
 SEARXNG_DOCKER_PORT=8888
+SEARXNG_LANGUAGE=zh-CN
+SEARXNG_PAGE_COUNT=3
 
-# 可选：显式指定搜索引擎；不配置时，存在 SEARXNG_URL 或 SEARXNG_AUTO_START=true 就使用 searxng，否则使用 duckduckgo
-DEFAULT_SEARCH_ENGINE=searxng
+# 可选：显式指定搜索引擎
+DEFAULT_SEARCH_ENGINE=tavily
 
 # 可选：商业搜索 API
 BING_API_KEY=你的Bing密钥
@@ -63,11 +68,17 @@ SERPAPI_API_KEY=你的SerpApi密钥
 LLM_API_KEY=你的OpenAI兼容接口密钥
 LLM_MODEL=你的模型名
 LLM_BASE_URL=https://你的OpenAI兼容接口/v1
+
+# 可选：启用正文 chunk 的向量重排
+EMBEDDING_API_KEY=你的OpenAI兼容接口密钥
+EMBEDDING_MODEL=你的embedding模型名
+EMBEDDING_BASE_URL=https://你的OpenAI兼容接口/v1
 ```
 
-> **提示**：SearXNG 是推荐默认搜索引擎。配置 `SEARXNG_URL` 或 `SEARXNG_AUTO_START=true` 后，服务会自动优先使用 SearXNG；未配置任何搜索服务时，降级为 DuckDuckGo。
+> **默认顺序**：显式 `DEFAULT_SEARCH_ENGINE` 优先；否则依次选择已配置的 Tavily、SearXNG，最后降级为 DuckDuckGo。
 > **自动 Docker**：`SEARXNG_AUTO_START=true` 需要本机已安装并启动 Docker。服务会创建/复用名为 `bigopen-llm-search-searxng` 的容器，并在 `~/.bigopen-llm-search/searxng/config/settings.yml` 生成启用 `json` 输出的 SearXNG 配置。
 > **AI 答案**：`LLM_API_KEY` 和 `LLM_MODEL` 同时存在时，`include_answer` 会调用 OpenAI 兼容接口生成带来源约束的答案；未配置时会自动降级为基于搜索结果/正文的抽取式摘要。
+> **成熟检索**：`web_search` 会执行 query planning、多路召回、URL 去重、RRF 融合和混合重排。配置 `EMBEDDING_MODEL` 后，advanced/semantic 搜索会对正文 chunks 做向量重排；未配置时自动降级为关键词和正文相关性重排。
 > **Topic 策略**：`topic` 的查询扩展词和重排词集中放在 `config/search-topics.json`，不要在搜索代码里为具体关键词加特例。
 
 ### 3. 启动服务
@@ -139,7 +150,15 @@ npm start
 | `country` | string | - | 优先显示特定国家结果 |
 | `exact_match` | boolean | false | 精确匹配模式 |
 | `engine` | string | - | 指定搜索引擎 |
-| `semantic` | boolean | false | 启用语义搜索 |
+| `engines` | string[] | - | 指定多个搜索引擎做多路召回 |
+| `language` | string | - | 搜索语言，传给支持的搜索引擎 |
+| `searxng_engines` | string[] | - | 指定 SearXNG 上游 engines |
+| `safesearch` | number | - | SearXNG 安全搜索等级：0/1/2 |
+| `page_count` | number | - | SearXNG 召回页数 (1-5) |
+| `max_recall_queries` | number | - | Query planner 最多生成的召回查询数 (1-6) |
+| `candidate_limit` | number | - | RRF 融合后进入重排的候选上限 |
+| `include_ranking_debug` | boolean | false | 返回召回查询、matched chunks 和 ranking signals |
+| `semantic` | boolean | false | 启用正文/向量重排；配置 embedding 时使用向量 |
 
 **使用示例：**
 
@@ -149,7 +168,8 @@ npm start
   "search_depth": "advanced",
   "max_results": 10,
   "time_range": "month",
-  "include_answer": true
+  "include_answer": true,
+  "include_ranking_debug": true
 }
 ```
 
@@ -249,11 +269,11 @@ npm start
 
 | 功能 | Tavily | 本项目 |
 |------|--------|--------|
-| 网页搜索 | ✅ | ✅ 支持 6 个搜索引擎 |
+| 网页搜索 | ✅ | ✅ 可直接使用 Tavily，并支持另外 6 个搜索引擎 |
 | 内容提取 | ✅ | ✅ 支持 markdown/text 格式 |
 | 网站爬取 | ✅ | ✅ 支持深度/广度控制 |
 | 网站地图 | ✅ | ✅ 支持路径过滤 |
-| 语义搜索 | ✅ | ✅ 相关性评分 + 关键短语提取 |
+| 成熟检索 | ✅ | ✅ Query planning + RRF + 正文/向量混合重排 |
 | 自定义搜索引擎 | ❌ | ✅ 支持多种搜索引擎 |
 | 开源免费 | ❌ | ✅ 完全开源 |
 
@@ -288,7 +308,11 @@ BigOpenLLMSearch/
 │   │   ├── content-extractor.ts # 内容提取
 │   │   ├── web-crawler.ts      # 网页爬虫
 │   │   ├── site-mapper.ts      # 网站地图
-│   │   └── semantic-search.ts  # 语义搜索
+│   │   ├── search-pipeline.ts  # 成熟搜索管线
+│   │   ├── search-planner.ts   # 查询规划
+│   │   ├── search-fusion.ts    # URL 去重与 RRF 融合
+│   │   ├── search-reranker.ts  # 正文/向量混合重排
+│   │   └── embedding-client.ts # 向量接口
 │   └── utils/
 │       ├── html-parser.ts      # HTML 解析
 │       └── cache.ts            # 缓存机制

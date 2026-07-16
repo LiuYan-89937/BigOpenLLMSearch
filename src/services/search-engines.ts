@@ -12,16 +12,34 @@ import {
 
 loadEnvFile();
 
+export const SUPPORTED_SEARCH_ENGINE_NAMES = [
+  "tavily",
+  "searxng",
+  "duckduckgo",
+  "bing",
+  "google",
+  "brave",
+  "serpapi",
+] as const;
+
+const DEFAULT_TAVILY_API_URL = "https://api.tavily.com/search";
+const DEFAULT_TAVILY_TIMEOUT_MS = 30_000;
+
 export interface SearchResult {
   title: string;
   url: string;
   snippet: string;
   content?: string;
+  raw_content?: string;
   score?: number;
   publishedDate?: string;
   favicon?: string;
   images?: string[];
   engine?: string;
+  recallQueries?: string[];
+  sourceEngines?: string[];
+  matchedChunks?: string[];
+  rankingSignals?: Record<string, number>;
 }
 
 export interface SearchResponse {
@@ -33,7 +51,11 @@ export interface SearchResponse {
   totalResults?: number;
   engine?: string;
   engines?: string[];
+  available_engines?: string[];
   errors?: Array<{ engine: string; error: string }>;
+  search_plan?: {
+    recall_queries: string[];
+  };
 }
 
 export interface SearchOptions {
@@ -50,6 +72,15 @@ export interface SearchOptions {
   excludeDomains?: string[];
   country?: string;
   exactMatch?: boolean;
+  engines?: string[];
+  language?: string;
+  searxngEngines?: string[];
+  safesearch?: number;
+  pageCount?: number;
+  includeRankingDebug?: boolean;
+  maxRecallQueries?: number;
+  candidateLimit?: number;
+  semantic?: boolean;
 }
 
 export interface SearchEngine {
@@ -293,6 +324,61 @@ export class SerpApiSearchEngine implements SearchEngine {
   }
 }
 
+export class TavilySearchEngine implements SearchEngine {
+  name = "tavily";
+
+  constructor(
+    private apiKey: string,
+    private apiUrl = DEFAULT_TAVILY_API_URL,
+    private timeoutMs = DEFAULT_TAVILY_TIMEOUT_MS
+  ) {}
+
+  async search(query: string, options: SearchOptions = {}): Promise<SearchResponse> {
+    const context = createSearchContext(query, options);
+    const response = await axios.post(
+      this.apiUrl,
+      {
+        api_key: this.apiKey,
+        query: context.providerQuery,
+        search_depth: options.searchDepth ?? "basic",
+        topic: options.topic ?? "general",
+        max_results: Math.min(context.options.maxResults ?? 10, 20),
+        time_range: options.timeRange,
+        start_date: options.startDate,
+        end_date: options.endDate,
+        include_answer: options.includeAnswer ?? false,
+        include_raw_content: options.includeRawContent ?? false,
+        include_images: options.includeImages ?? false,
+        include_domains: normalizeDomains(options.includeDomains),
+        exclude_domains: normalizeDomains(options.excludeDomains),
+        country: options.country,
+      },
+      {
+        headers: { "Content-Type": "application/json" },
+        timeout: this.timeoutMs,
+      }
+    );
+    const results = (response.data.results ?? []).map((item: any) => ({
+      title: item.title ?? "",
+      url: item.url ?? "",
+      snippet: item.content ?? item.snippet ?? "",
+      content: item.content,
+      raw_content: item.raw_content,
+      score: typeof item.score === "number" ? item.score : undefined,
+      publishedDate: item.published_date,
+      favicon: item.favicon,
+      engine: this.name,
+    } satisfies SearchResult));
+    const images = normalizeTavilyImages(response.data.images);
+
+    return {
+      ...finalizeEngineResponse(context, this.name, results, results.length),
+      answer: typeof response.data.answer === "string" ? response.data.answer : undefined,
+      images: images.length ? images : undefined,
+    };
+  }
+}
+
 export class SearXNGSearchEngine implements SearchEngine {
   name = "searxng";
 
@@ -301,31 +387,55 @@ export class SearXNGSearchEngine implements SearchEngine {
   async search(query: string, options: SearchOptions = {}): Promise<SearchResponse> {
     const context = createSearchContext(query, options);
     const topicProfile = getSearchTopicProfile(options.topic);
-    const params: Record<string, unknown> = {
-      q: context.providerQuery,
-      format: "json",
-      pageno: 1,
-    };
+    const pageCount = resolveSearXNGPageCount(options);
+    const results: SearchResult[] = [];
+    let totalResults: number | undefined;
 
-    if (topicProfile.nativeCategory === "news") {
-      params.categories = "news";
+    for (let pageNumber = 1; pageNumber <= pageCount; pageNumber++) {
+      const params: Record<string, unknown> = {
+        q: context.providerQuery,
+        format: "json",
+        pageno: pageNumber,
+      };
+
+      if (topicProfile.nativeCategory === "news") {
+        params.categories = "news";
+      }
+
+      const language = options.language || process.env.SEARXNG_LANGUAGE;
+      if (language) {
+        params.language = language;
+      }
+
+      const engines = options.searxngEngines?.length
+        ? options.searxngEngines
+        : parseList(process.env.SEARXNG_ENGINES);
+      if (engines.length > 0) {
+        params.engines = engines.join(",");
+      }
+
+      const safesearch = options.safesearch ?? parseOptionalInteger(process.env.SEARXNG_SAFESEARCH);
+      if (safesearch !== undefined) {
+        params.safesearch = safesearch;
+      }
+
+      if (options.timeRange) {
+        params.time_range = options.timeRange;
+      }
+
+      const response = await axios.get(`${this.baseUrl.replace(/\/$/, "")}/search`, { params });
+      totalResults = response.data.number_of_results ?? totalResults;
+      results.push(...(response.data.results ?? []).map((item: any) => ({
+        title: item.title,
+        url: item.url,
+        snippet: item.content || item.snippet || "",
+        publishedDate: item.publishedDate || item.published_date,
+        score: item.score,
+        engine: this.name,
+      } satisfies SearchResult)));
     }
 
-    if (options.timeRange) {
-      params.time_range = options.timeRange;
-    }
-
-    const response = await axios.get(`${this.baseUrl.replace(/\/$/, "")}/search`, { params });
-    const results: SearchResult[] = (response.data.results ?? []).map((item: any) => ({
-      title: item.title,
-      url: item.url,
-      snippet: item.content || "",
-      publishedDate: item.publishedDate,
-      score: item.score,
-      engine: this.name,
-    }));
-
-    return finalizeEngineResponse(context, this.name, results, response.data.number_of_results);
+    return finalizeEngineResponse(context, this.name, results, totalResults);
   }
 }
 
@@ -335,6 +445,14 @@ export class SearchEngineManager {
 
   constructor() {
     this.engines.set("duckduckgo", new DuckDuckGoSearchEngine());
+
+    if (process.env.TAVILY_API_KEY) {
+      this.engines.set("tavily", new TavilySearchEngine(
+        process.env.TAVILY_API_KEY,
+        process.env.TAVILY_API_URL?.trim() || DEFAULT_TAVILY_API_URL,
+        parsePositiveInteger(process.env.TAVILY_TIMEOUT_MS, DEFAULT_TAVILY_TIMEOUT_MS)
+      ));
+    }
 
     if (process.env.BING_API_KEY) {
       this.engines.set("bing", new BingSearchEngine(process.env.BING_API_KEY));
@@ -374,6 +492,29 @@ export class SearchEngineManager {
 
   getAvailableEngines(): string[] {
     return Array.from(this.engines.keys());
+  }
+
+  getDefaultEngineName(): string {
+    return this.defaultEngine;
+  }
+
+  async recall(query: string, options: SearchOptions & { engine?: string } = {}): Promise<SearchResponse> {
+    const requestedMaxResults = options.maxResults ?? 20;
+    const engine = this.getEngine(options.engine);
+    await this.ensureEngineReady(engine.name);
+    const response = await engine.search(query, {
+      ...options,
+      maxResults: requestedMaxResults,
+    });
+
+    return {
+      ...response,
+      query,
+      results: filterResults(response.results, query, options).slice(0, requestedMaxResults),
+      images: options.includeImages ? collectImages(response.results) : undefined,
+      answer: options.includeAnswer ? response.answer : undefined,
+      engine: engine.name,
+    };
   }
 
   async search(query: string, options: SearchOptions & { engine?: string } = {}): Promise<SearchResponse> {
@@ -457,6 +598,10 @@ function selectDefaultEngine(configuredEngine: string | undefined, engines: Map<
   const normalizedEngine = configuredEngine?.trim().toLowerCase();
   if (normalizedEngine && engines.has(normalizedEngine)) {
     return normalizedEngine;
+  }
+
+  if (engines.has("tavily")) {
+    return "tavily";
   }
 
   if (engines.has("searxng")) {
@@ -640,6 +785,44 @@ function mapSerpApiTimeRange(timeRange?: SearchOptions["timeRange"]): string | u
   }
 }
 
+function resolveSearXNGPageCount(options: SearchOptions): number {
+  const configuredPageCount = options.pageCount ??
+    parseOptionalInteger(process.env.SEARXNG_PAGE_COUNT) ??
+    defaultSearXNGPageCount(options.searchDepth);
+
+  return Math.min(Math.max(configuredPageCount, 1), 5);
+}
+
+function defaultSearXNGPageCount(searchDepth?: SearchOptions["searchDepth"]): number {
+  switch (searchDepth) {
+    case "advanced":
+      return 3;
+    case "basic":
+      return 2;
+    case "fast":
+    case "ultra-fast":
+    default:
+      return 1;
+  }
+}
+
+function parseOptionalInteger(value: string | undefined): number | undefined {
+  const parsed = Number.parseInt(value ?? "", 10);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function parsePositiveInteger(value: string | undefined, fallback: number): number {
+  const parsed = Number.parseInt(value ?? "", 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function parseList(value: string | undefined): string[] {
+  return (value ?? "")
+    .split(",")
+    .map(item => item.trim())
+    .filter(Boolean);
+}
+
 function flattenDuckDuckGoTopics(topics: any[]): any[] {
   return topics.flatMap(topic => {
     if (Array.isArray(topic.Topics)) {
@@ -648,6 +831,23 @@ function flattenDuckDuckGoTopics(topics: any[]): any[] {
 
     return [topic];
   });
+}
+
+function normalizeTavilyImages(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return Array.from(new Set(value.flatMap(item => {
+    if (typeof item === "string") {
+      return item.trim() ? [item.trim()] : [];
+    }
+    if (item && typeof item === "object" && "url" in item) {
+      const url = String((item as { url?: unknown }).url ?? "").trim();
+      return url ? [url] : [];
+    }
+    return [];
+  })));
 }
 
 export const searchEngineManager = new SearchEngineManager();
