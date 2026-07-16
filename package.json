@@ -35,12 +35,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/LiuYan-89937/WebSearchApi.git"
+    "url": "git+https://github.com/LiuYan-89937/BigOpenLLMSearch.git"
   },
   "bugs": {
-    "url": "https://github.com/LiuYan-89937/WebSearchApi/issues"
+    "url": "https://github.com/LiuYan-89937/BigOpenLLMSearch/issues"
   },
-  "homepage": "https://github.com/LiuYan-89937/WebSearchApi#readme",
+  "homepage": "https://github.com/LiuYan-89937/BigOpenLLMSearch#readme",
   "engines": {
     "node": ">=18"
   },
